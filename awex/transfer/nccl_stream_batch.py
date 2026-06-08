@@ -115,7 +115,7 @@ class NcclColocateStreamBatchTransport:
                     )
                     p2p_op = dist.P2POp(
                         dist.isend if async_op else dist.send,
-                        tensor_sliced.clone(),
+                        tensor_sliced,
                         recv_rank,
                         group=weights_update_group,
                     )
