@@ -111,7 +111,7 @@ class NcclColocateTransport:
                     )
                     p2p_op = dist.P2POp(
                         dist.isend,
-                        tensor_sliced.contiguous(),
+                        tensor_sliced.clone(),
                         op.recv_rank,
                         group=weights_update_group,
                     )
