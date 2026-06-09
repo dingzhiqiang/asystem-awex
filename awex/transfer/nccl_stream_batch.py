@@ -604,15 +604,28 @@ class NcclColocateStreamBatchTransport:
                     recv_rank = train_to_infer_device_mapping.get(
                         op.recv_rank, op.recv_rank
                     )
-                    cloned = tensor_sliced.clone()
+                    # Only copy non-contiguous slices. A contiguous slice of
+                    # the IPC-shared training buffer is sent zero-copy: the
+                    # per-chunk synchronize() below bounds the async isend
+                    # flight window to a single chunk, so the train side
+                    # cannot mutate the IPC base mid-flight (it stays blocked
+                    # on write_finished). Non-contiguous slices are made
+                    # contiguous, which also isolates them. This drops the
+                    # full-clone peak to just the non-contiguous payload.
+                    if tensor_sliced.is_contiguous():
+                        send_buf = tensor_sliced
+                    else:
+                        send_buf = tensor_sliced.contiguous()
+                        chunk_clone_bytes += (
+                            send_buf.numel() * send_buf.element_size()
+                        )
                     p2p_op = dist.P2POp(
                         dist.isend if async_op else dist.send,
-                        cloned,
+                        send_buf,
                         recv_rank,
                         group=weights_update_group,
                     )
                     p2p_ops.append((op, p2p_op))
-                    chunk_clone_bytes += cloned.numel() * cloned.element_size()
                 chunk_send_p2p_ops[mapped_peer_rank] = p2p_ops
 
             for recv_from_rank, ops in recv_per_peer.items():
