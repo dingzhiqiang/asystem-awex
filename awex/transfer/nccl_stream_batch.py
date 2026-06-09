@@ -373,16 +373,17 @@ class NcclColocateStreamBatchTransport:
 
     def _execute_ops_concurrent(self, ops_dict, peer_ranks):
         """
-        Execute ops from multiple peers with interleaved execution for better concurrency.
+        Issue all P2P ops for the given peers as one batched NCCL group call.
 
-        Instead of executing all ops for one peer sequentially (peer1_all_ops, peer2_all_ops, ...),
-        this method interleaves operations in a round-robin fashion (peer1_op1, peer2_op1, ...,
-        peer1_op2, peer2_op2, ...). This allows operations from different peers to overlap and
-        execute concurrently on the GPU.
-
-        Each peer rank consistently uses the same CUDA stream to maintain ordering within
-        that peer's operations, while different peers use different streams (up to max)
-        for concurrent execution.
+        Why batch_isend_irecv instead of manual multi-stream posting: the previous
+        implementation posted tens of thousands of isend/irecv individually across
+        many CUDA streams and then work.wait()-ed all of them. At 32-rank scale with
+        highly imbalanced per-peer op counts this overwhelmed NCCL's P2P channels and
+        deadlocked ~half the ranks in work.wait() (Round 0 Phase 2). Wrapping every op
+        in a single dist.batch_isend_irecv (ncclGroupStart/End) lets NCCL aggregate and
+        schedule the transfers internally. It stays deadlock-safe as long as per-(src,dst)
+        FIFO order is preserved, which it is: ops for each peer are appended in their
+        original op_idx order.
 
         Args:
             ops_dict: Dictionary mapping peer_rank to list of (plan_op, p2p_op) tuples
@@ -391,48 +392,17 @@ class NcclColocateStreamBatchTransport:
         Returns:
             Total number of ops executed
         """
-        # Collect ops from all peers that have operations, along with their peer_rank
-        peer_ops_with_rank = []
-        active_peer_ranks = []
+        p2p_ops = []
         for peer_rank in peer_ranks:
             if peer_rank in ops_dict:
-                peer_ops_with_rank.append((peer_rank, ops_dict[peer_rank]))
-                active_peer_ranks.append(peer_rank)
+                for _, p2p_op in ops_dict[peer_rank]:
+                    p2p_ops.append(p2p_op)
 
-        if not peer_ops_with_rank:
+        if not p2p_ops:
             return 0
 
-        # Allocate stream indices sequentially to active peer ranks for even distribution
-        # This ensures ranks are evenly distributed across available streams
-        peer_to_stream_idx = {}
-        for idx, peer_rank in enumerate(active_peer_ranks):
-            stream_idx = idx % len(self._stream_pool)
-            peer_to_stream_idx[peer_rank] = stream_idx
-
-        # Find the maximum number of ops across all peers
-        max_ops = max(len(ops) for _, ops in peer_ops_with_rank)
-        total_ops = 0
-
-        # Execute ops in round-robin fashion: one op from each peer per iteration
-        # This allows concurrent execution across multiple peers
-        work_handles = []
-        for op_idx in range(max_ops):
-            for peer_rank, ops in peer_ops_with_rank:
-                if op_idx < len(ops):
-                    _, p2p_op = ops[op_idx]
-                    # Use the stream allocated to this peer to maintain ordering
-                    stream_idx = peer_to_stream_idx[peer_rank]
-                    stream = self._stream_pool[stream_idx]
-                    with device_util.stream(stream):
-                        result = p2p_op.op(
-                            p2p_op.tensor, p2p_op.peer, group=p2p_op.group
-                        )
-                        if p2p_op.op is dist.isend or p2p_op.op is dist.irecv:
-                            work_handles.append(result)
-                    total_ops += 1
-
-        # Wait for all async operations to complete
-        for work in work_handles:
+        works = dist.batch_isend_irecv(p2p_ops)
+        for work in works:
             work.wait()
 
-        return total_ops
+        return len(p2p_ops)
