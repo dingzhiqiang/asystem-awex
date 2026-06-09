@@ -70,6 +70,26 @@ class NcclColocateStreamBatchTransport:
         validate_rank_mappings(
             train_to_infer_device_mapping, infer_to_train_device_mapping
         )
+        # Direction 4: dump the device mappings (validate_rank_mappings only
+        # checks they are mutual inverses, not the actual rank correspondence).
+        # train->infer maps train-domain ranks (>=infer_world_size) to the
+        # colocated infer rank; identity would mean no domain shift (a bug).
+        t2i_identity = all(
+            k == v for k, v in train_to_infer_device_mapping.items()
+        )
+        i2t_identity = all(
+            k == v for k, v in infer_to_train_device_mapping.items()
+        )
+        logger.info(
+            f"[{rank_coordinate}] train_to_infer_device_mapping="
+            f"{dict(sorted(train_to_infer_device_mapping.items()))} "
+            f"(identity={t2i_identity})"
+        )
+        logger.info(
+            f"[{rank_coordinate}] infer_to_train_device_mapping="
+            f"{dict(sorted(infer_to_train_device_mapping.items()))} "
+            f"(identity={i2t_identity})"
+        )
         start_time = time.time()
 
         # Get send/recv operations dict
@@ -227,8 +247,20 @@ class NcclColocateStreamBatchTransport:
         num_rounds = int(math.log2(world_size))
         prefix = f"[{os.getpid()}] [{rank_coordinate}] [step {step_id}]"
         start_time = time.time()
+        is_pow2 = world_size > 0 and (world_size & (world_size - 1)) == 0
+        if not is_pow2:
+            logger.warning(
+                f"{prefix} world_size={world_size} is NOT a power of 2; recursive "
+                f"partition only runs {num_rounds} rounds and will leave some "
+                f"rank pairs uncovered -> hang"
+            )
+        all_send_keys = set(all_send_p2p_ops.keys())
+        all_recv_keys = set(all_recv_p2p_ops.keys())
+        covered_send_peers = set()
+        covered_recv_peers = set()
         logger.info(
-            f"{prefix} Starting recursive partition transfer with {num_rounds} rounds"
+            f"{prefix} Starting recursive partition transfer with {num_rounds} rounds; "
+            f"send_peers={sorted(all_send_keys)} recv_peers={sorted(all_recv_keys)}"
         )
         for round_idx in range(num_rounds):
             partition_size = world_size // (2**round_idx)
@@ -252,6 +284,22 @@ class NcclColocateStreamBatchTransport:
                 f"{prefix} Round {round_idx}: partition_size={partition_size}, "
                 f"partition=[{partition_base}, {partition_end}), half={half}, "
                 f"in_first_half={in_first_half}, other_half=[{other_half_start}, {other_half_end})"
+            )
+
+            # Butterfly coverage: each round this rank both sends to and recvs
+            # from every peer in other_half. Accumulate which send/recv peer
+            # keys fall inside this round's range; any plan op whose peer key is
+            # never covered across all rounds will never be enqueued -> the
+            # opposite rank waits forever (hang).
+            round_other_half = set(range(other_half_start, other_half_end))
+            round_send_active = round_other_half & all_send_keys
+            round_recv_active = round_other_half & all_recv_keys
+            covered_send_peers |= round_send_active
+            covered_recv_peers |= round_recv_active
+            logger.info(
+                f"{prefix} Round {round_idx} coverage: "
+                f"send_active={sorted(round_send_active)} "
+                f"recv_active={sorted(round_recv_active)}"
             )
 
             round_start = time.time()
@@ -293,6 +341,22 @@ class NcclColocateStreamBatchTransport:
             )
         device_util.synchronize()
         duration = time.time() - start_time
+        uncovered_send = all_send_keys - covered_send_peers
+        uncovered_recv = all_recv_keys - covered_recv_peers
+        if uncovered_send or uncovered_recv:
+            logger.warning(
+                f"{prefix} BUTTERFLY COVERAGE GAP after {num_rounds} rounds: "
+                f"UNCOVERED_SEND={sorted(uncovered_send)} "
+                f"UNCOVERED_RECV={sorted(uncovered_recv)} "
+                f"(these peer ops were never enqueued -> opposite rank will hang); "
+                f"all_send={sorted(all_send_keys)} covered_send={sorted(covered_send_peers)}; "
+                f"all_recv={sorted(all_recv_keys)} covered_recv={sorted(covered_recv_peers)}"
+            )
+        else:
+            logger.info(
+                f"{prefix} BUTTERFLY COVERAGE OK: all {len(all_send_keys)} send + "
+                f"{len(all_recv_keys)} recv peers covered across {num_rounds} rounds"
+            )
         logger.info(f"{prefix} All {num_rounds} rounds completed in {duration:.4f}s")
 
     def _execute_ops_concurrent(self, ops_dict, peer_ranks):
