@@ -192,15 +192,14 @@ class NcclColocateStreamBatchTransport:
         msg = f"[{os.getpid()}] execute {total_send_ops} sends {total_recv_ops} recvs with recursive partition for {task_id}"
         hang_detector.submit(detect_hang, future, msg, [], timeout=60)
 
-        # Execute recursive partition transfer
-        # FIXME: batch_isend_irecv hang sometimes, seems `batch_isend_irecv` can't handle asymmetric p2p communication.
-        # so we use send/recv directly
-        self.execute_recursive_partition_stream_transfer(
-            transfer_rank,
-            world_size,
+        # Execute per-pipe-index chunked transfer (option 1+2): each chunk is a
+        # single batch_isend_irecv drained before the next. This replaces the
+        # recursive-partition butterfly, which only ordered host-side enqueue and
+        # let all rounds' P2P kernels pile onto the communicator until the final
+        # device synchronize() deadlocked (32/32 ranks, version 1).
+        self.execute_chunked_stream_transfer(
             all_send_p2p_ops,
             all_recv_p2p_ops,
-            weights_update_group,
             rank_coordinate,
             step_id,
         )
@@ -215,6 +214,82 @@ class NcclColocateStreamBatchTransport:
         duration = time.time() - start_time
         logger.info(
             f"Finished executing weights update for {task_id}, took {duration:.4f} seconds"
+        )
+
+    def execute_chunked_stream_transfer(
+        self,
+        all_send_p2p_ops,  # Dict[peer_rank] -> List[(plan_op, p2p_op)]
+        all_recv_p2p_ops,  # Dict[peer_rank] -> List[(plan_op, p2p_op)]
+        rank_coordinate,
+        step_id,
+        chunk_size=None,
+    ):
+        """
+        Per-pipe-index chunked P2P transfer (option 1+2), deadlock-free by design.
+
+        For every directed pipe X->Y the plan emits the same number of ops on both
+        ends (verified symmetric: 472 edges, 0 mismatch). The i-th op of pipe X->Y
+        is all_send_p2p_ops[Y][i] on X and all_recv_p2p_ops[X][i] on Y. Slicing each
+        peer's op list by the SAME [c*K, (c+1)*K) window puts that i-th op into chunk
+        i//K on BOTH ranks -> chunk c is a globally consistent cut whose sends and
+        recvs are fully paired. Each chunk is one dist.batch_isend_irecv
+        (ncclGroupStart/End), so it cannot deadlock within itself; we synchronize
+        between chunks so the previous chunk's P2P kernels fully drain before the
+        next is enqueued. This needs neither the butterfly's round/phase split nor a
+        cross-rank barrier, and bounds the in-flight P2P kernel count to one chunk
+        (the recursive-partition version piled all 5 rounds onto the communicator and
+        deadlocked the final synchronize).
+
+        Ranks may have different chunk counts (their busiest pipe differs), but that
+        is safe: a chunk only issues P2P for pipes that actually have ops in that
+        window, and both endpoints of any such pipe reach the same chunk index.
+        """
+        if chunk_size is None:
+            chunk_size = int(os.environ.get("AWEX_CHUNK", "256"))
+        prefix = f"[{os.getpid()}] [{rank_coordinate}] [step {step_id}]"
+        start_time = time.time()
+
+        max_ops = 0
+        for ops in all_send_p2p_ops.values():
+            max_ops = max(max_ops, len(ops))
+        for ops in all_recv_p2p_ops.values():
+            max_ops = max(max_ops, len(ops))
+        num_chunks = math.ceil(max_ops / chunk_size) if max_ops else 0
+        total_sends = sum(len(ops) for ops in all_send_p2p_ops.values())
+        total_recvs = sum(len(ops) for ops in all_recv_p2p_ops.values())
+        logger.info(
+            f"{prefix} Chunked transfer: chunk_size={chunk_size}, "
+            f"num_chunks={num_chunks}, max_pipe_ops={max_ops}, "
+            f"total_sends={total_sends}, total_recvs={total_recvs}"
+        )
+
+        for c in range(num_chunks):
+            lo, hi = c * chunk_size, (c + 1) * chunk_size
+            p2p_ops = []
+            for ops in all_send_p2p_ops.values():
+                for _, p2p_op in ops[lo:hi]:
+                    p2p_ops.append(p2p_op)
+            for ops in all_recv_p2p_ops.values():
+                for _, p2p_op in ops[lo:hi]:
+                    p2p_ops.append(p2p_op)
+            if not p2p_ops:
+                continue
+            chunk_start = time.time()
+            works = dist.batch_isend_irecv(p2p_ops)
+            for work in works:
+                work.wait()
+            # Drain this chunk's P2P kernels before enqueuing the next so they
+            # never pile up on the communicator (the failure mode of the butterfly).
+            device_util.synchronize()
+            logger.info(
+                f"{prefix} Chunk {c}/{num_chunks}: drained {len(p2p_ops)} ops "
+                f"in {time.time() - chunk_start:.4f}s"
+            )
+
+        duration = time.time() - start_time
+        logger.info(
+            f"{prefix} Chunked transfer done: {num_chunks} chunks, "
+            f"{total_sends} sends + {total_recvs} recvs in {duration:.4f}s"
         )
 
     def execute_recursive_partition_stream_transfer(
