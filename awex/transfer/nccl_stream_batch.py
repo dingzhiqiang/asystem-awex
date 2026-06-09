@@ -339,18 +339,6 @@ class NcclColocateStreamBatchTransport:
                 f"phase1={num_ops} ops, phase2={num_ops2} ops, "
                 f"took {round_duration:.4f}s"
             )
-            # Cross-rank round barrier: the butterfly only matches NCCL P2P ops
-            # by (src,dst) FIFO order (no MPI tag). Under extreme per-edge load
-            # imbalance, a lightly-loaded rank can finish this round's work.wait()
-            # and race into the next round's smaller partition, enqueuing P2P ops
-            # on a pipe whose peer is still draining THIS round -> cross-round FIFO
-            # contention -> circular wait -> deadlock. A barrier here forces every
-            # rank to finish round_idx before any rank starts round_idx+1, so each
-            # (src,dst) pipe only ever carries ops from a single round at a time.
-            dist.barrier(
-                group=weights_update_group,
-                device_ids=[device_util.current_device()],
-            )
         device_util.synchronize()
         duration = time.time() - start_time
         uncovered_send = all_send_keys - covered_send_peers
