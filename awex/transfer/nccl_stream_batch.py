@@ -139,9 +139,16 @@ class NcclColocateStreamBatchTransport:
                     recv_rank = train_to_infer_device_mapping.get(
                         op.recv_rank, op.recv_rank
                     )
+                    cloned = tensor_sliced.clone()
+                    # Wire-size parity with the receiver's dtype (see the
+                    # chunked path / Problem 69: bf16 gate.weight into an fp32
+                    # recv slot wedges the receiver forever).
+                    recv_dtype = getattr(op.recv_shard_meta, "dtype", None)
+                    if recv_dtype is not None and cloned.dtype != recv_dtype:
+                        cloned = cloned.to(recv_dtype)
                     p2p_op = dist.P2POp(
                         dist.isend if async_op else dist.send,
-                        tensor_sliced.clone(),
+                        cloned,
                         recv_rank,
                         group=weights_update_group,
                     )
@@ -629,6 +636,15 @@ class NcclColocateStreamBatchTransport:
                         op.recv_rank, op.recv_rank
                     )
                     cloned = tensor_sliced.clone()
+                    # Wire-size parity: the receiver posts irecv with ITS shard
+                    # dtype. 961 plan ops (mlp.gate.weight, 124 edges) are bf16
+                    # on the train side but fp32 on the sglang side; sending
+                    # bf16 bytes into an fp32-sized recv leaves the receiver
+                    # waiting forever (deterministic chunk-7 deadlock,
+                    # Problem 69). Cast the clone to the receiver's dtype.
+                    recv_dtype = getattr(op.recv_shard_meta, "dtype", None)
+                    if recv_dtype is not None and cloned.dtype != recv_dtype:
+                        cloned = cloned.to(recv_dtype)
                     p2p_op = dist.P2POp(
                         dist.isend if async_op else dist.send,
                         cloned,
