@@ -25,7 +25,6 @@ import torch.distributed as dist
 
 from awex import logging
 from awex.transfer.nccl_comm import (
-    compute_two_phase_partition,
     detect_hang,
     execute_tensors_to_copy,
     validate_rank_mappings,
@@ -186,13 +185,13 @@ class NcclColocateStreamBatchTransport:
         msg = f"[{os.getpid()}] execute {total_send_ops} sends {total_recv_ops} recvs with recursive partition for {task_id}"
         hang_detector.submit(detect_hang, future, msg, [], timeout=60)
 
-        # Execute circle-shift sequential transfer. The recursive-partition
-        # butterfly submits a whole phase's ops in one batch_isend_irecv and
-        # deadlocks at 32-rank / PP4->PP1 asymmetric scale (host enqueue
-        # returns but GPU drain never completes; data layer verified fully
-        # symmetric). Circle-shift issues blocking send/recv per peer so
-        # in-flight P2P count is O(1) peers, not O(total ops).
-        self.execute_circle_shift_sequential_transfer(
+        # Recursive-partition butterfly with per-peer batch_isend_irecv (see
+        # _execute_ops_concurrent). The phase structure is symmetric and the
+        # data layer is verified fully consistent; the earlier deadlock was
+        # purely from submitting a whole half's ops in one batch. Issuing one
+        # batch per peer caps in-flight P2P at O(1) peer and stays
+        # deadlock-free.
+        self.execute_recursive_partition_stream_transfer(
             transfer_rank,
             world_size,
             all_send_p2p_ops,
@@ -327,144 +326,47 @@ class NcclColocateStreamBatchTransport:
         Returns:
             Total number of ops executed
         """
-        # Collect ops from all peers that have operations, along with their peer_rank
-        peer_ops_with_rank = []
-        active_peer_ranks = []
+        # Per-peer batch_isend_irecv. Submitting a WHOLE half's ops in one
+        # batch_isend_irecv (the previous behaviour) deadlocks at 32-rank /
+        # PP4->PP1 asymmetric scale: round 0's other-half has 16 peers and
+        # thousands of ops, and flooding NCCL with that many concurrent P2P
+        # channels exhausts them so the GPU drain never completes (data layer
+        # verified fully symmetric — the failure is purely runtime concurrency
+        # scale). Instead we walk peers in ascending rank order and issue ONE
+        # batch_isend_irecv per peer, capping in-flight P2P at O(1) peer.
+        #
+        # This is deadlock-free because a recursive-partition phase is
+        # single-direction: in phase 1 every first-half rank only SENDS and
+        # every second-half rank only RECVS (phase 2 is the mirror). A
+        # (sender, receiver) pair's per-peer batch is matched by NCCL group
+        # on (src, dst, group); serializing peers cannot form a wait cycle
+        # since no rank both sends and receives within the same phase. (This
+        # is exactly why recursive partition's symmetric phases are safe and
+        # the circle-shift directed ring was not.)
+        #
+        # Both sides must walk peers in the SAME (ascending) order so the
+        # k-th batch on a sender pairs with the corresponding recv on the
+        # receiver. peer_ranks is already an ascending range here.
+        total_ops = 0
         for peer_rank in peer_ranks:
-            if peer_rank in ops_dict:
-                peer_ops_with_rank.append((peer_rank, ops_dict[peer_rank]))
-                active_peer_ranks.append(peer_rank)
-
-        if not peer_ops_with_rank:
-            return 0
-
-        # Submit ALL phase-local P2P ops as a single batch_isend_irecv. The
-        # multi-stream round-robin original (commented out below) hangs when
-        # the transfer plan is asymmetric across ranks: per-rank stream index
-        # assignment based on local enumerate(active_peer_ranks) creates
-        # different stream allocations on the two sides of a peer pair, and
-        # NCCL P2P FIFO ordering on a stream then deadlocks. Submitting all
-        # ops in one batch lets NCCL coordinate ordering globally; pairs are
-        # matched by (src, dst, group) regardless of stream.
-        all_p2p_ops = []
-        for peer_rank, ops in peer_ops_with_rank:
-            for _, p2p_op in ops:
-                all_p2p_ops.append(p2p_op)
-        if not all_p2p_ops:
-            return 0
-        works = dist.batch_isend_irecv(all_p2p_ops)
-        for work in works:
-            work.wait()
-        # Force GPU completion before returning. work.wait() only blocks
-        # CPU thread until CUDA event records 'enqueued', not actual NCCL
-        # kernel completion. Without this sync, downstream chunk steps may
-        # race ahead and the per-chunk torch.cuda.synchronize() at the end
-        # of _run_chunked exposes the resulting NCCL kernel hang only at
-        # chunk boundary instead of at the actual offending phase.
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return len(all_p2p_ops)
-
-    def execute_circle_shift_sequential_transfer(
-        self,
-        transfer_rank,
-        world_size,
-        all_send_p2p_ops,  # Dict[peer_rank] -> List[(plan_op, p2p_op)]
-        all_recv_p2p_ops,  # Dict[peer_rank] -> List[(plan_op, p2p_op)]
-        weights_update_group,
-        rank_coordinate,
-        step_id,
-    ):
-        """Circle-shift + per-peer sequential blocking send/recv.
-
-        Replaces the recursive-partition butterfly (which submits a whole
-        phase's ops in one batch_isend_irecv and deadlocks at 32-rank /
-        PP4->PP1 asymmetric scale: the GPU drain after host enqueue never
-        completes because the single batch floods NCCL P2P channels).
-
-        Instead we walk world_size circle-shift stages (transfer_rank +/-
-        stage). Each stage involves exactly ONE send peer and ONE recv peer,
-        so at any instant the number of in-flight P2P ops is O(1) peers
-        rather than O(total ops). Within a stage we use two-phase coloring
-        (compute_two_phase_partition) so a sender and its paired receiver run
-        opposite phases, and issue blocking dist.send / dist.recv op-by-op
-        (FIFO matched per (src,dst,group)). This is the older Asystem
-        known-good path (reader commit 9632174) before the batch optimization.
-        """
-        prefix = f"[{os.getpid()}] [{rank_coordinate}] [step {step_id}]"
-        start_time = time.time()
-        logger.info(
-            f"{prefix} Starting CIRCLE-SHIFT sequential transfer "
-            f"with {world_size} stages"
-        )
-        for stage in range(world_size):
-            send_to_rank = (transfer_rank + stage) % world_size
-            recv_from_rank = (transfer_rank - stage) % world_size
-
-            send_ops = all_send_p2p_ops.get(send_to_rank, [])
-            recv_ops = all_recv_p2p_ops.get(recv_from_rank, [])
-
-            if stage == 0:
-                # Self stage: no P2P (self-copy handled separately upstream).
+            ops = ops_dict.get(peer_rank)
+            if not ops:
                 continue
-
-            partition = compute_two_phase_partition(
-                transfer_rank, stage, world_size
-            )
-            stage_name = f"{rank_coordinate} stage {stage}"
-
-            # Phase 1: partition 0 sends, partition 1 receives.
-            if partition == 0:
-                self._run_sequential_ops(
-                    send_ops, f"send for {stage_name}", weights_update_group
-                )
-            else:
-                self._run_sequential_ops(
-                    recv_ops, f"recv for {stage_name}", weights_update_group
-                )
-
-            # Phase 2: partition 0 receives, partition 1 sends.
-            if partition == 0:
-                self._run_sequential_ops(
-                    recv_ops, f"recv for {stage_name}", weights_update_group
-                )
-            else:
-                self._run_sequential_ops(
-                    send_ops, f"send for {stage_name}", weights_update_group
-                )
-        device_util.synchronize()
-        duration = time.time() - start_time
-        logger.info(
-            f"{prefix} All {world_size} circle-shift stages "
-            f"completed in {duration:.4f}s"
-        )
-
-    def _run_sequential_ops(self, p2p_op_list, stage, weights_update_group):
-        """Issue a list of (plan_op, p2p_op) via blocking send/recv in order.
-
-        Per (src,dst,group) FIFO ordering is preserved by issuing in list
-        order. A hang detector dumps py-spy if any single op blocks > 30s.
-        """
-        if not p2p_op_list:
-            return
-        num_sends = sum(1 for _, op in p2p_op_list if op.op == dist.isend)
-        num_recvs = sum(1 for _, op in p2p_op_list if op.op == dist.irecv)
-        msg = (
-            f"[{os.getpid()}] sequential send/recv for {len(p2p_op_list)} ops "
-            f"({num_sends} sends, {num_recvs} recvs) for {stage}"
-        )
-        future = Future()
-        hang_detector.submit(detect_hang, future, msg, p2p_op_list)
-        for _, p2p_op in p2p_op_list:
-            if p2p_op.op == dist.isend:
-                dist.send(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
-            elif p2p_op.op == dist.irecv:
-                dist.recv(p2p_op.tensor, p2p_op.peer, group=p2p_op.group)
-            else:
-                raise ValueError(f"Unknown p2p op: {p2p_op.op}")
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        future.set_result(True)
+            p2p_ops = [p2p_op for _, p2p_op in ops]
+            if not p2p_ops:
+                continue
+            works = dist.batch_isend_irecv(p2p_ops)
+            for work in works:
+                work.wait()
+            # Force GPU completion before the next peer. work.wait() only
+            # blocks the CPU thread until the CUDA event records 'enqueued',
+            # not actual NCCL kernel completion; syncing per peer keeps
+            # in-flight P2P bounded to one peer and surfaces any hang at the
+            # offending peer rather than at a later chunk boundary.
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_ops += len(p2p_ops)
+        return total_ops
 
     def _run_chunked(
         self,
@@ -743,7 +645,7 @@ class NcclColocateStreamBatchTransport:
                         (op, p2p_op)
                     )
 
-            self.execute_circle_shift_sequential_transfer(
+            self.execute_recursive_partition_stream_transfer(
                 transfer_rank,
                 world_size,
                 chunk_send_p2p_ops,
