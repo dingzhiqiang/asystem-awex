@@ -347,6 +347,8 @@ class NcclColocateStreamBatchTransport:
         # Both sides must walk peers in the SAME (ascending) order so the
         # k-th batch on a sender pairs with the corresponding recv on the
         # receiver. peer_ranks is already an ascending range here.
+        trace = os.environ.get("AWEX_P2P_TRACE", "").strip() in ("1", "true", "True")
+        my_rank = self.transfer_rank
         total_ops = 0
         for peer_rank in peer_ranks:
             ops = ops_dict.get(peer_rank)
@@ -355,9 +357,19 @@ class NcclColocateStreamBatchTransport:
             p2p_ops = [p2p_op for _, p2p_op in ops]
             if not p2p_ops:
                 continue
+            if trace:
+                logger.info(
+                    f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
+                    f"nops={len(p2p_ops)} -> batch_isend_irecv (pre-wait)"
+                )
             works = dist.batch_isend_irecv(p2p_ops)
             for work in works:
                 work.wait()
+            if trace:
+                logger.info(
+                    f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
+                    f"work.wait returned (enqueued) -> synchronize (waiting peer)"
+                )
             # Force GPU completion before the next peer. work.wait() only
             # blocks the CPU thread until the CUDA event records 'enqueued',
             # not actual NCCL kernel completion; syncing per peer keeps
@@ -365,6 +377,11 @@ class NcclColocateStreamBatchTransport:
             # offending peer rather than at a later chunk boundary.
             if hasattr(torch, "cuda") and torch.cuda.is_available():
                 torch.cuda.synchronize()
+            if trace:
+                logger.info(
+                    f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
+                    f"synchronize done (drained peer)"
+                )
             total_ops += len(p2p_ops)
         return total_ops
 
