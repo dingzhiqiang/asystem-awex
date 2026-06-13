@@ -128,6 +128,12 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         if self.enable_colocate_mode:
             self._init_reader_in_colocate_mode()
         self.deserialized_weights = {}
+        # Delta transfer base (env-gated, see _maybe_reconstruct_delta): CPU
+        # copy of the last fully-synced train-shard payload + its version.
+        # Sparse payloads are reconstructed against this base before the
+        # (unchanged) NCCL reshard transport runs.
+        self._delta_base: dict = {}
+        self._delta_base_version = None
         logger.info(
             f"Created NCCL weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
@@ -317,7 +323,10 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         device_util.synchronize(device_id=device_util.current_device())
         tensors = reconstruct_tensors_from_groups(group_shared, metadata)
         device_util.synchronize(device_id=device_util.current_device())
-        self.deserialized_weights = dict(zip(names, tensors))
+        named_tensors = dict(zip(names, tensors))
+        self.deserialized_weights = self._maybe_reconstruct_delta(
+            named_tensors, step_id, device_id
+        )
         logger.info(
             f"Deserialized {len(self.deserialized_weights)} parameters and {len(group_shared)} groups"
         )
@@ -325,6 +334,111 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"GPU status after deserialization for rank {self.rank_coordinate}:\n{get_gpu_status()}"
         )
         logger.info(f"Open fds after deserialization: {count_open_fds()}")
+
+    def _maybe_reconstruct_delta(self, named_tensors, step_id, device_id):
+        """Turn a delta payload back into full train-shard tensors.
+
+        Env-gated by ``AWEX_DELTA_TRANSFER``. The reconstructed dict is keyed
+        and shaped exactly like a dense payload, so the downstream NCCL
+        transport runs unchanged. The CPU ``_delta_base`` holds the last
+        fully-synced train-shard payload; sparse patches are scattered onto a
+        copy of the base, and the base is refreshed in place.
+
+        Payloads are self-describing (a ``__awex_delta_header__`` tensor marks a
+        delta), so dense full-sync payloads simply (re)seed the base.
+        """
+        delta_enabled = os.environ.get("AWEX_DELTA_TRANSFER", "0") == "1"
+        from awex.delta import (
+            decode_delta_payload,
+            is_delta_payload,
+            reconstruct_against_base,
+        )
+
+        if not is_delta_payload(named_tensors):
+            if delta_enabled:
+                # Dense full sync: snapshot as the new base for later deltas.
+                self._delta_base = {
+                    name: t.detach().to("cpu", copy=True)
+                    for name, t in named_tensors.items()
+                }
+                self._delta_base_version = step_id
+                logger.info(
+                    "Delta: seeded base from dense full sync at step %d (%d params)",
+                    step_id,
+                    len(self._delta_base),
+                )
+            return named_tensors
+
+        # From here on the payload IS a delta.
+        if not delta_enabled:
+            raise RuntimeError(
+                "Received a delta weight payload but AWEX_DELTA_TRANSFER is not "
+                "enabled on the inference side; writer/reader env mismatch."
+            )
+        decoded = decode_delta_payload(named_tensors)
+        header = decoded.header
+        if self._delta_base_version is None or not self._delta_base:
+            self._request_full_sync(step_id, "reader_base_missing")
+            raise RuntimeError(
+                f"Delta payload at step {step_id} but reader has no base "
+                f"(base_version={self._delta_base_version}); requested full sync."
+            )
+        if header.base_version != self._delta_base_version:
+            self._request_full_sync(step_id, "version_chain_broken")
+            raise RuntimeError(
+                f"Delta version chain broken at step {step_id}: payload base="
+                f"{header.base_version}, reader base={self._delta_base_version}; "
+                f"requested full sync."
+            )
+
+        start = time.time()
+        try:
+            result, counts = reconstruct_against_base(
+                self._delta_base, decoded, device_id
+            )
+        except ValueError as exc:
+            # e.g. a sparse patch for a name absent from the base: the full
+            # shape is unknown and must not be dead-reckoned. Treat as a
+            # broken chain and request a full sync.
+            self._request_full_sync(step_id, "reconstruct_failed")
+            raise RuntimeError(
+                f"Delta reconstruction failed at step {step_id}: {exc}; "
+                f"requested full sync."
+            ) from exc
+        self._delta_base_version = header.payload_version
+        device_util.synchronize(device_id=device_util.current_device())
+        logger.info(
+            "Delta: reconstructed step %d (base=%d) sparse=%d dense=%d "
+            "unchanged=%d, took %.3fs",
+            step_id,
+            header.base_version,
+            counts["sparse"],
+            counts["dense"],
+            counts["unchanged"],
+            time.time() - start,
+        )
+        return result
+
+    def _full_sync_marker_key(self):
+        """Per-(ip, device) marker key so each colocate pair is independent
+        and the paired writer can delete it without racing other writers."""
+        return (
+            f"awex_delta_require_full_sync_{get_ip_address()}_"
+            f"{device_util.current_device()}"
+        )
+
+    def _request_full_sync(self, step_id, reason):
+        """Signal the paired writer to fall back to a dense full sync."""
+        try:
+            self.meta_server_client.put_object(
+                self._full_sync_marker_key(),
+                (self.rank_coordinate, step_id, reason),
+            )
+            logger.error(
+                "Delta: requested full sync at step %d (reason=%s)", step_id, reason
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Delta: failed to request full sync: %s", exc)
 
     @staticmethod
     def _sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs):
