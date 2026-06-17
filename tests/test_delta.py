@@ -35,6 +35,7 @@ patches_to_dict = _mod_patch.patches_to_dict
 dict_to_patches = _mod_patch.dict_to_patches
 DeltaWeightDetector = _mod_detector.DeltaWeightDetector
 remap_delta_indices = _mod_remap.remap_delta_indices
+remap_mask_for_op = _mod_remap.remap_mask_for_op
 _unravel_index = _mod_remap._unravel_index
 _ravel_multi_index = _mod_remap._ravel_multi_index
 
@@ -359,6 +360,108 @@ class TestRemapDeltaIndices:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# remap_mask_for_op: per-op entry point the transport send path calls
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+
+def _make_op(train_slices, inf_slices, infer_shape, name="w"):
+    """Mock CommunicationOperation: only the fields remap_mask_for_op reads."""
+    return SimpleNamespace(
+        send_shard_meta=SimpleNamespace(name=name),
+        recv_shard_meta=SimpleNamespace(name=name, shape=tuple(infer_shape)),
+        train_slices=tuple(train_slices),
+        inf_slices=tuple(inf_slices),
+    )
+
+
+class TestRemapMaskForOp:
+    def test_mask_to_patch_2d_tp_split(self):
+        # train shard [8,4]; this op sends rows 4-7 to an infer shard [4,4].
+        train = torch.zeros(8, 4, dtype=torch.bfloat16)
+        train[4, 0] = 1.0  # flat 16 -> infer (0,0)=0
+        train[5, 1] = 2.0  # flat 21 -> infer (1,1)=5
+        train[0, 0] = 9.0  # row 0, NOT in this op's overlap -> dropped
+        mask = train != 0
+        op = _make_op((slice(4, 8), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        patch = remap_mask_for_op("w", mask, train, (8, 4), op)
+        assert patch is not None
+        assert torch.equal(patch.indices.sort().values,
+                           torch.tensor([0, 5], dtype=torch.int32))
+        # values gathered from train at the changed (in-overlap) positions
+        assert set(patch.values.float().tolist()) == {1.0, 2.0}
+
+    def test_mask_no_overlap_returns_none(self):
+        train = torch.zeros(4, 4, dtype=torch.bfloat16)
+        train[0, 0] = 1.0  # row 0, op wants rows 2-3
+        mask = train != 0
+        op = _make_op((slice(2, 4), slice(None)), (slice(0, 2), slice(None)), (2, 4))
+        assert remap_mask_for_op("w", mask, train, (4, 4), op) is None
+
+    def test_mask_empty_returns_none(self):
+        train = torch.zeros(4, 4, dtype=torch.bfloat16)
+        mask = train != 0  # all False
+        op = _make_op((slice(None), slice(None)), (slice(None), slice(None)), (4, 4))
+        assert remap_mask_for_op("w", mask, train, (4, 4), op) is None
+
+    def test_mask_1d_identity(self):
+        train = torch.zeros(10, dtype=torch.bfloat16)
+        train[3] = 5.0
+        mask = train != 0
+        op = _make_op((slice(None),), (slice(None),), (10,))
+        patch = remap_mask_for_op("b", mask, train, (10,), op)
+        assert patch is not None
+        assert patch.indices.item() == 3
+        assert patch.values.item() == 5.0
+
+    def test_reconstruct_equals_dense_after_remap(self):
+        # End-to-end: apply remapped patch onto an infer shard == direct slice copy.
+        torch.manual_seed(0)
+        train = torch.randn(8, 4, dtype=torch.bfloat16)
+        prev = train.clone()
+        train[4, 2] += 1.0
+        train[6, 0] += 1.0
+        train[2, 1] += 1.0  # row 2 not in overlap (rows 4-7)
+        mask = bitwise_changed_mask(train, prev)
+        op = _make_op((slice(4, 8), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        patch = remap_mask_for_op("w", mask, train, (8, 4), op)
+        # infer shard starts as the old train rows 4-7
+        infer = prev[4:8].clone()
+        apply_sparse_patch_(infer, patch.indices, patch.values)
+        assert torch.equal(infer, train[4:8])  # matches new train rows 4-7
+
+
+class TestRemapGuards:
+    def test_strided_slice_raises(self):
+        patch = SparseWeightPatch(
+            name="w",
+            indices=torch.tensor([0], dtype=torch.int32),
+            values=torch.tensor([1.0], dtype=torch.bfloat16),
+        )
+        with pytest.raises(NotImplementedError, match="strided"):
+            remap_delta_indices(
+                patch, train_shape=(10,),
+                train_slices=(slice(0, 8, 2),), inf_slices=(slice(0, 4),),
+                infer_shape=(4,),
+            )
+
+    def test_int32_overflow_raises(self):
+        # infer shard >= 2**31 elements -> int32 flat index unsafe.
+        patch = SparseWeightPatch(
+            name="huge",
+            indices=torch.tensor([0], dtype=torch.int32),
+            values=torch.tensor([1.0], dtype=torch.bfloat16),
+        )
+        with pytest.raises(ValueError, match="2\\*\\*31|overflow"):
+            remap_delta_indices(
+                patch, train_shape=(2**31 + 8,),
+                train_slices=(slice(None),), inf_slices=(slice(None),),
+                infer_shape=(2**31 + 8,),
+            )
 
 
 # ---------------------------------------------------------------------------

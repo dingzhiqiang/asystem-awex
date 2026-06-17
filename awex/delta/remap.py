@@ -10,7 +10,6 @@ the overlap region for each (train_rank, infer_rank) pair.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import torch
 
@@ -25,7 +24,7 @@ def remap_delta_indices(
     train_slices: tuple[slice, ...],
     inf_slices: tuple[slice, ...],
     infer_shape: tuple[int, ...],
-) -> Optional[SparseWeightPatch]:
+) -> SparseWeightPatch | None:
     """Remap flat delta indices from training shard space to inference shard space.
 
     Uses the overlap region defined by CommunicationOperation to:
@@ -65,8 +64,9 @@ def remap_delta_indices(
         s = train_slices[dim]
         if s == slice(None):
             continue
+        _assert_unit_step(s, dim, patch.name)
         start = s.start or 0
-        stop = s.stop or train_shape[dim]
+        stop = s.stop if s.stop is not None else train_shape[dim]
         mask &= (multi_idx[dim] >= start) & (multi_idx[dim] < stop)
 
     if not mask.any():
@@ -78,10 +78,15 @@ def remap_delta_indices(
         dim_idx = multi_idx[dim][mask]
         t_start = (train_slices[dim].start or 0) if train_slices[dim] != slice(None) else 0
         i_start = (inf_slices[dim].start or 0) if inf_slices[dim] != slice(None) else 0
+        if train_slices[dim] != slice(None):
+            _assert_unit_step(train_slices[dim], dim, patch.name)
+        if inf_slices[dim] != slice(None):
+            _assert_unit_step(inf_slices[dim], dim, patch.name)
         remapped.append(dim_idx - t_start + i_start)
 
     # Step 4: flatten for inference shard
     new_flat = _ravel_multi_index(remapped, infer_shape)
+    _assert_int32_safe(new_flat, infer_shape, patch.name)
 
     return SparseWeightPatch(
         name=patch.name,
@@ -157,3 +162,76 @@ def _ravel_multi_index(
         flat += multi_idx[dim] * stride
         stride *= shape[dim]
     return flat
+
+
+# int32 flat index ceiling: a single inference shard must stay below 2**31
+# elements, otherwise the int32 patch indices overflow.
+_MAX_INT32_NUMEL = 2**31
+
+
+def _assert_unit_step(s: slice, dim: int, name: str) -> None:
+    """Remap math assumes contiguous (step==1) slices. AWEX transfer plans only
+    build ``slice(start, stop)`` (step is None == 1); a strided slice would
+    silently miscompute the overlap, so fail loud instead."""
+    if s.step not in (None, 1):
+        raise NotImplementedError(
+            f"remap_delta_indices: strided slice step={s.step} on dim {dim} of "
+            f"'{name}' is unsupported (transfer plans are expected contiguous)."
+        )
+
+
+def _assert_int32_safe(flat: torch.Tensor, shape: tuple[int, ...], name: str) -> None:
+    numel = 1
+    for d in shape:
+        numel *= d
+    if numel >= _MAX_INT32_NUMEL:
+        raise ValueError(
+            f"remap_delta_indices: inference shard '{name}' has {numel} elements "
+            f">= 2**31; int32 flat indices overflow. Fall back to dense for this param."
+        )
+
+
+def remap_mask_for_op(
+    name: str,
+    changed_mask: torch.Tensor,
+    values_source: torch.Tensor,
+    train_shape: tuple[int, ...],
+    op,
+) -> SparseWeightPatch | None:
+    """Per-op entry point for the transport layer.
+
+    Computes the sparse patch for a single CommunicationOperation directly from
+    a boolean change mask, without first materializing a full-shard patch. This
+    is what the P2P send path calls once per op: the same param's mask is shared
+    across all ops (computed once), each op projects its own overlap sub-region
+    into inference-shard index space.
+
+    Args:
+        name: HF parameter name (``op.send_shard_meta.name``).
+        changed_mask: bool tensor, same numel/shape as the train-shard param,
+            True where the bf16 element changed this step.
+        values_source: the train-shard param tensor (new values are gathered
+            from it at the changed positions).
+        train_shape: shape of the train-shard tensor.
+        op: CommunicationOperation, provides ``train_slices`` / ``inf_slices``
+            and ``recv_shard_meta.shape`` (inference-shard shape).
+
+    Returns:
+        SparseWeightPatch with indices in the inference-shard flat space and the
+        gathered values, or None if no changed element falls in this op's
+        overlap region.
+    """
+    flat_mask = changed_mask.reshape(-1)
+    idx = flat_mask.nonzero(as_tuple=True)[0]
+    if idx.numel() == 0:
+        return None
+    vals = values_source.reshape(-1).index_select(0, idx)
+    patch = SparseWeightPatch(name=name, indices=idx.to(torch.int32), values=vals)
+    return remap_delta_indices(
+        patch=patch,
+        train_shape=tuple(train_shape),
+        train_slices=op.train_slices,
+        inf_slices=op.inf_slices,
+        infer_shape=tuple(op.recv_shard_meta.shape),
+    )
+
