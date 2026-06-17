@@ -552,3 +552,85 @@ class NcclColocateStreamBatchTransport:
             applied,
         )
         return applied
+
+    def apply_delta_colocate(
+        self,
+        train_to_infer_device_mapping,
+        infer_to_train_device_mapping,
+        transfer_rank,
+        rank_coordinate,
+        world_size,
+        send_transfer_plan,
+        recv_transfer_plan,
+        weights_update_group,
+        send_full_params,  # {hf_name: reconstructed full train-shard tensor}
+        masks,  # {hf_name: bool change mask over the train-shard}
+        recv_parameters,  # self.parameters (live inference view)
+        value_dtype,
+        *,
+        step_id=-1,
+    ):
+        """Reader-facing entry: self-copy locally (full) + cross-rank delta.
+
+        Design §5.4 first version: the local self-copy segment is not the
+        bandwidth bottleneck, so it reuses the dense path on a locally
+        reconstructed full tensor; only the cross-rank P2P segment ships sparse
+        deltas. ``send_full_params`` is the full reconstructed train-shard (from
+        ``_delta_base`` + delta applied), used for self-copy; ``masks`` drives
+        the per-op sparse projection for cross-rank ops.
+        """
+        from awex.delta.delta_p2p import build_send_payloads_by_op
+
+        # --- Self-copy segment (local, full, dense logic) ---
+        send_ops = dict(send_transfer_plan.operations)
+        train_slice_context = {}
+        tensors_to_copy = []
+        for peer_rank, ops in send_ops.items():
+            mapped_peer = train_to_infer_device_mapping.get(peer_rank, peer_rank)
+            if mapped_peer != transfer_rank:
+                continue  # cross-rank handled below
+            for op in ops:
+                send_tensor = send_full_params[op.send_shard_meta.name]
+                tensors_to_copy.append(
+                    slice_tensor(
+                        send_tensor, op, True, slice_context=train_slice_context
+                    )
+                )
+        if tensors_to_copy:
+            local_send_rank = infer_to_train_device_mapping[transfer_rank]
+            execute_tensors_to_copy(
+                tensors_to_copy,
+                recv_transfer_plan.operations[local_send_rank],
+                recv_parameters,
+                f"delta self-copy for {rank_coordinate}-{step_id}",
+            )
+
+        # --- Cross-rank segment (sparse delta over P2P) ---
+        # Build per-op remapped payloads only for cross-rank send ops.
+        cross_ops = []
+        for peer_rank, ops in send_ops.items():
+            mapped_peer = train_to_infer_device_mapping.get(peer_rank, peer_rank)
+            if mapped_peer == transfer_rank:
+                continue
+            cross_ops.extend(ops)
+        send_payloads_by_op = build_send_payloads_by_op(
+            cross_ops, masks, send_full_params
+        )
+
+        # Always enter the cross-rank rounds (even with zero local cross ops):
+        # the recursive-partition schedule is collective, a peer may send to us.
+        # Mirrors the dense path, which unconditionally calls the transfer.
+        return self.transfer_delta_in_colocate_mode(
+            train_to_infer_device_mapping,
+            infer_to_train_device_mapping,
+            transfer_rank,
+            rank_coordinate,
+            world_size,
+            send_transfer_plan,
+            recv_transfer_plan,
+            weights_update_group,
+            send_payloads_by_op,
+            recv_parameters,
+            value_dtype,
+            step_id=step_id,
+        )
