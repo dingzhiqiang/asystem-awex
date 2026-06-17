@@ -104,6 +104,32 @@ def nnz_vector(payloads: list[OpDeltaPayload]) -> torch.Tensor:
     return torch.tensor([p.nnz for p in payloads], dtype=torch.int32)
 
 
+def op_key(op):
+    """Stable per-op key for payload lookup, matching the transport layer.
+
+    A param may have multiple ops (different overlap / recv rank); key by
+    (send name, recv name, recv_rank, train_slices) so each op maps to its own
+    remapped payload. Must stay in sync with ``nccl_stream_batch._op_key``.
+    """
+    return (
+        op.send_shard_meta.name,
+        op.recv_shard_meta.name,
+        op.recv_rank,
+        tuple((s.start, s.stop, s.step) for s in op.train_slices),
+    )
+
+
+def build_send_payloads_by_op(
+    ops: list,
+    masks: dict[str, torch.Tensor],
+    send_params: dict[str, torch.Tensor],
+) -> dict:
+    """Same as build_send_patches but keyed by op_key for transport lookup."""
+    return {
+        op_key(op): p for op, p in zip(ops, build_send_patches(ops, masks, send_params))
+    }
+
+
 def allocate_recv_buffers(
     nnz_list: list[int],
     value_dtype: torch.dtype,

@@ -563,6 +563,24 @@ class TestDeltaP2PProtocol:
         assert len(payloads) == 1
         assert payloads[0].nnz == 0
 
+    def test_build_payloads_by_op_keyed(self):
+        # keyed builder maps each op to its payload via op_key (transport lookup).
+        train = torch.zeros(8, 4, dtype=torch.bfloat16)
+        train[1, 0] = 1.0  # op0 (rows 0-3)
+        train[5, 0] = 1.0  # op1 (rows 4-7)
+        mask = bitwise_changed_mask(train, torch.zeros(8, 4, dtype=torch.bfloat16))
+        op0 = _make_op((slice(0, 4), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        op0.recv_rank = 0
+        op1 = _make_op((slice(4, 8), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        op1.recv_rank = 1
+        by_op = _mod_p2p.build_send_payloads_by_op([op0, op1], {"w": mask}, {"w": train})
+        assert _mod_p2p.op_key(op0) in by_op
+        assert _mod_p2p.op_key(op1) in by_op
+        assert by_op[_mod_p2p.op_key(op0)].nnz == 1
+        assert by_op[_mod_p2p.op_key(op1)].nnz == 1
+        # distinct keys (different recv_rank + train_slices)
+        assert _mod_p2p.op_key(op0) != _mod_p2p.op_key(op1)
+
 
 # ---------------------------------------------------------------------------
 # Codec: bitwise comparison

@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 hang_detector = ThreadPoolExecutor(max_workers=1)
 
 
+def _op_key(op):
+    """Delegate to awex.delta.delta_p2p.op_key (single source of truth)."""
+    from awex.delta.delta_p2p import op_key
+
+    return op_key(op)
+
+
 class NcclColocateStreamBatchTransport:
     MAX_STREAMS = 64
 
@@ -351,3 +358,197 @@ class NcclColocateStreamBatchTransport:
             work.wait()
 
         return total_ops
+
+    # ------------------------------------------------------------------
+    # Delta (sparse) transfer: two-round variable-length P2P.
+    # GPU/multi-process validation pending (no distributed ctx on CPU).
+    # Reuses execute_recursive_partition_stream_transfer unchanged so the
+    # deadlock-safe symmetric schedule is preserved; only the per-op tensors
+    # differ (round 1: nnz int32[1]; round 2: idx int32[nnz] + val[nnz]).
+    # ------------------------------------------------------------------
+    def transfer_delta_in_colocate_mode(
+        self,
+        train_to_infer_device_mapping,
+        infer_to_train_device_mapping,
+        transfer_rank,
+        rank_coordinate,
+        world_size,
+        send_transfer_plan,
+        recv_transfer_plan,
+        weights_update_group,
+        send_payloads_by_op,  # {send_shard_meta.name+train_slices key -> OpDeltaPayload}
+        recv_parameters,
+        value_dtype,
+        *,
+        step_id=-1,
+    ):
+        """Cross-rank P2P delta transfer (bandwidth-critical path).
+
+        send_payloads_by_op: per-op OpDeltaPayload (indices already remapped to
+            inference-shard flat space, values gathered), keyed per send op.
+        recv_parameters: live inference params (self.parameters, write-through).
+        Local (self-copy) ops are NOT handled here — the caller reconstructs
+        them locally (design §5.4 first version).
+        """
+        send_ops = dict(send_transfer_plan.operations)
+        recv_ops = dict(recv_transfer_plan.operations)
+
+        # ---- Round 1: exchange nnz (fixed 1 int32 per op, symmetric) ----
+        nnz_send_p2p = {}  # peer -> [(op, P2POp)]
+        nnz_recv_p2p = {}
+        recv_nnz_buf = {}  # peer -> [(op, int32[1] tensor)]
+        device = device_util.current_device()
+
+        for peer_rank, ops in send_ops.items():
+            mapped_peer = train_to_infer_device_mapping.get(peer_rank, peer_rank)
+            if mapped_peer == transfer_rank:
+                continue  # self-copy handled by caller
+            p2p = []
+            for op in ops:
+                payload = send_payloads_by_op[_op_key(op)]
+                nnz_t = torch.tensor([payload.nnz], dtype=torch.int32, device=device)
+                recv_rank = train_to_infer_device_mapping.get(
+                    op.recv_rank, op.recv_rank
+                )
+                p2p.append(
+                    (
+                        op,
+                        dist.P2POp(
+                            dist.isend, nnz_t, recv_rank, group=weights_update_group
+                        ),
+                    )
+                )
+            nnz_send_p2p[mapped_peer] = p2p
+
+        for send_rank, ops in recv_ops.items():
+            recv_from = train_to_infer_device_mapping[send_rank]
+            if recv_from == transfer_rank:
+                continue
+            p2p = []
+            bufs = []
+            for op in ops:
+                nnz_t = torch.empty(1, dtype=torch.int32, device=device)
+                p2p.append(
+                    (
+                        op,
+                        dist.P2POp(
+                            dist.irecv, nnz_t, recv_from, group=weights_update_group
+                        ),
+                    )
+                )
+                bufs.append((op, nnz_t))
+            nnz_recv_p2p[recv_from] = p2p
+            recv_nnz_buf[recv_from] = bufs
+
+        self.execute_recursive_partition_stream_transfer(
+            transfer_rank,
+            world_size,
+            nnz_send_p2p,
+            nnz_recv_p2p,
+            weights_update_group,
+            rank_coordinate,
+            step_id,
+        )
+        device_util.synchronize()
+
+        # ---- Allocate recv idx/val buffers from received nnz ----
+        recv_payload_bufs = {}  # peer -> [(op, idx_buf, val_buf)]
+        for peer, bufs in recv_nnz_buf.items():
+            entries = []
+            for op, nnz_t in bufs:
+                n = int(nnz_t.item())
+                entries.append(
+                    (
+                        op,
+                        torch.empty(n, dtype=torch.int32, device=device),
+                        torch.empty(n, dtype=value_dtype, device=device),
+                    )
+                )
+            recv_payload_bufs[peer] = entries
+
+        # ---- Round 2: exchange idx + val (sizes now known both sides) ----
+        # Two P2POps per op (idx then val); symmetric on both sides.
+        pay_send_p2p = {}
+        pay_recv_p2p = {}
+        for peer_rank, ops in send_ops.items():
+            mapped_peer = train_to_infer_device_mapping.get(peer_rank, peer_rank)
+            if mapped_peer == transfer_rank:
+                continue
+            p2p = []
+            for op in ops:
+                payload = send_payloads_by_op[_op_key(op)]
+                recv_rank = train_to_infer_device_mapping.get(
+                    op.recv_rank, op.recv_rank
+                )
+                idx = payload.indices.to(device).contiguous()
+                val = payload.values.to(device).contiguous()
+                p2p.append(
+                    (
+                        op,
+                        dist.P2POp(
+                            dist.isend, idx, recv_rank, group=weights_update_group
+                        ),
+                    )
+                )
+                p2p.append(
+                    (
+                        op,
+                        dist.P2POp(
+                            dist.isend, val, recv_rank, group=weights_update_group
+                        ),
+                    )
+                )
+            pay_send_p2p[mapped_peer] = p2p
+
+        for peer, entries in recv_payload_bufs.items():
+            p2p = []
+            for op, idx_buf, val_buf in entries:
+                p2p.append(
+                    (
+                        op,
+                        dist.P2POp(
+                            dist.irecv, idx_buf, peer, group=weights_update_group
+                        ),
+                    )
+                )
+                p2p.append(
+                    (
+                        op,
+                        dist.P2POp(
+                            dist.irecv, val_buf, peer, group=weights_update_group
+                        ),
+                    )
+                )
+            pay_recv_p2p[peer] = p2p
+
+        self.execute_recursive_partition_stream_transfer(
+            transfer_rank,
+            world_size,
+            pay_send_p2p,
+            pay_recv_p2p,
+            weights_update_group,
+            rank_coordinate,
+            step_id,
+        )
+        device_util.synchronize()
+
+        # ---- Scatter received patches into live inference params ----
+        from awex.delta.codec import apply_sparse_patch_
+
+        applied = 0
+        for entries in recv_payload_bufs.values():
+            for op, idx_buf, val_buf in entries:
+                if idx_buf.numel() == 0:
+                    continue
+                target = slice_tensor(
+                    recv_parameters[op.recv_shard_meta.name], op, False
+                )
+                apply_sparse_patch_(target, idx_buf, val_buf)
+                applied += 1
+        logger.info(
+            "[%s] delta transfer step %s: applied %d non-empty patches",
+            rank_coordinate,
+            step_id,
+            applied,
+        )
+        return applied
