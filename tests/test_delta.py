@@ -465,6 +465,106 @@ class TestRemapGuards:
 
 
 # ---------------------------------------------------------------------------
+# delta_p2p: variable-length payload protocol (control plane + data plane)
+# ---------------------------------------------------------------------------
+
+_mod_p2p = _load("awex.delta.delta_p2p", "delta_p2p.py")
+build_send_patches = _mod_p2p.build_send_patches
+nnz_vector = _mod_p2p.nnz_vector
+allocate_recv_buffers = _mod_p2p.allocate_recv_buffers
+scatter_recv_into = _mod_p2p.scatter_recv_into
+OpDeltaPayload = _mod_p2p.OpDeltaPayload
+
+
+def _slice_fn(tensor, op):
+    """Mock slice_tensor for the inference (recv) side."""
+    return tensor[op.inf_slices]
+
+
+def _transmit(payloads, recv_buffers):
+    """Simulate the data-plane copy: sender payload -> receiver pre-alloc buffers.
+
+    Asserts the control plane (nnz) pre-sized the buffers correctly (this is
+    exactly what NCCL would require to stay symmetric)."""
+    for p, (idx_buf, val_buf) in zip(payloads, recv_buffers, strict=True):
+        assert idx_buf.numel() == p.nnz
+        idx_buf.copy_(p.indices)
+        val_buf.copy_(p.values)
+
+
+class TestDeltaP2PProtocol:
+    def test_roundtrip_two_ops_equals_dense(self):
+        # train shard [8,4]; two ops to two infer shards [4,4] (rows 0-3, 4-7).
+        torch.manual_seed(1)
+        train = torch.randn(8, 4, dtype=torch.bfloat16)
+        prev = train.clone()
+        train[1, 2] += 1.0  # row 1 -> op0
+        train[5, 0] += 1.0  # row 5 -> op1
+        mask = bitwise_changed_mask(train, prev)
+        op0 = _make_op((slice(0, 4), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        op1 = _make_op((slice(4, 8), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        ops = [op0, op1]
+
+        # sender
+        payloads = build_send_patches(ops, {"w": mask}, {"w": train})
+        nnz = nnz_vector(payloads)
+        assert nnz.tolist() == [1, 1]
+
+        # receiver: each infer shard starts as old train rows
+        infer = {"w_op0": prev[0:4].clone(), "w_op1": prev[4:8].clone()}
+        # (in real transport recv_params is keyed by name; here both ops target
+        #  the same recv name "w" on different ranks — simulate per-op targets)
+        recv_buffers = allocate_recv_buffers(nnz.tolist(), train.dtype)
+        _transmit(payloads, recv_buffers)
+
+        # apply op0 onto rows-0-3 shard, op1 onto rows-4-7 shard
+        scatter_recv_into({"w": infer["w_op0"]}, [op0], [recv_buffers[0]], _slice_fn)
+        scatter_recv_into({"w": infer["w_op1"]}, [op1], [recv_buffers[1]], _slice_fn)
+        assert torch.equal(infer["w_op0"], train[0:4])
+        assert torch.equal(infer["w_op1"], train[4:8])
+
+    def test_zero_nnz_op_keeps_slot(self):
+        # op whose overlap had no change must still produce an (empty) payload,
+        # so sender/receiver iterate the same op count (deadlock safety).
+        train = torch.zeros(8, 4, dtype=torch.bfloat16)
+        train[1, 0] = 1.0  # only row 1 -> op0 changes; op1 (rows 4-7) unchanged
+        prev = torch.zeros(8, 4, dtype=torch.bfloat16)
+        mask = bitwise_changed_mask(train, prev)
+        op0 = _make_op((slice(0, 4), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        op1 = _make_op((slice(4, 8), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        payloads = build_send_patches([op0, op1], {"w": mask}, {"w": train})
+        assert len(payloads) == 2          # both ops kept
+        assert payloads[0].nnz == 1
+        assert payloads[1].nnz == 0        # zero-nnz slot preserved
+        nnz = nnz_vector(payloads)
+        assert nnz.tolist() == [1, 0]
+        # receiver pre-allocates an empty buffer for op1 and applies nothing
+        recv_buffers = allocate_recv_buffers(nnz.tolist(), train.dtype)
+        _transmit(payloads, recv_buffers)
+        infer1 = prev[4:8].clone()
+        n = scatter_recv_into({"w": infer1}, [op1], [recv_buffers[1]], _slice_fn)
+        assert n == 0
+        assert torch.equal(infer1, prev[4:8])  # untouched
+
+    def test_all_zero_nnz_version(self):
+        # a version where nothing changed: every op zero-nnz, still symmetric.
+        train = torch.ones(8, 4, dtype=torch.bfloat16)
+        mask = bitwise_changed_mask(train, train.clone())  # all False
+        op0 = _make_op((slice(0, 4), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        op1 = _make_op((slice(4, 8), slice(None)), (slice(0, 4), slice(None)), (4, 4))
+        payloads = build_send_patches([op0, op1], {"w": mask}, {"w": train})
+        assert [p.nnz for p in payloads] == [0, 0]
+        assert nnz_vector(payloads).tolist() == [0, 0]
+
+    def test_missing_param_yields_zero_nnz_slot(self):
+        # op references a param with no mask/source -> still a zero-nnz slot.
+        op0 = _make_op((slice(None),), (slice(None),), (4,), name="ghost")
+        payloads = build_send_patches([op0], {}, {})
+        assert len(payloads) == 1
+        assert payloads[0].nnz == 0
+
+
+# ---------------------------------------------------------------------------
 # Codec: bitwise comparison
 # ---------------------------------------------------------------------------
 
