@@ -134,6 +134,10 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         # (unchanged) NCCL reshard transport runs.
         self._delta_base: dict = {}
         self._delta_base_version = None
+        # Per-param change mask for the current delta step ({name: bool tensor}),
+        # or None on a dense/anchor step. Drives the cross-rank sparse P2P in
+        # _update_weights_in_colocate_mode; reset every collect.
+        self._delta_masks = None
         logger.info(
             f"Created NCCL weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
@@ -336,17 +340,21 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         logger.info(f"Open fds after deserialization: {count_open_fds()}")
 
     def _maybe_reconstruct_delta(self, named_tensors, step_id, device_id):
-        """Turn a delta payload back into full train-shard tensors.
+        """Reconstruct the full train-shard from a delta + derive change masks.
 
-        Env-gated by ``AWEX_DELTA_TRANSFER``. The reconstructed dict is keyed
-        and shaped exactly like a dense payload, so the downstream NCCL
-        transport runs unchanged. The CPU ``_delta_base`` holds the last
-        fully-synced train-shard payload; sparse patches are scattered onto a
-        copy of the base, and the base is refreshed in place.
+        Env-gated by ``AWEX_DELTA_TRANSFER``. On a delta payload this rebuilds
+        the full local train-shard from the CPU ``_delta_base`` (needed for the
+        local self-copy segment and as the base for the next version) AND
+        derives the per-param change mask, stored on ``self._delta_masks``, which
+        drives the *cross-rank* sparse P2P in ``_update_weights_in_colocate_mode``
+        (only the changed elements cross the wire — the v1 mistake was sending
+        the reconstructed full tensor cross-rank).
 
         Payloads are self-describing (a ``__awex_delta_header__`` tensor marks a
-        delta), so dense full-sync payloads simply (re)seed the base.
+        delta); dense full-sync payloads (re)seed the base and clear the masks.
+        Returns the full (dense-shaped) named tensor dict either way.
         """
+        self._delta_masks = None  # default: dense/anchor step
         delta_enabled = os.environ.get("AWEX_DELTA_TRANSFER", "0") == "1"
         from awex.delta import (
             decode_delta_payload,
@@ -407,6 +415,22 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             ) from exc
         self._delta_base_version = header.payload_version
         device_util.synchronize(device_id=device_util.current_device())
+        # Build per-param change masks (for cross-rank sparse P2P). dense-
+        # fallback params changed in full; sparse params changed at scattered
+        # positions; unchanged params get no mask entry (False everywhere).
+        masks = {}
+        for name, full in result.items():
+            if name in decoded.dense:
+                masks[name] = torch.ones(
+                    full.shape, dtype=torch.bool, device=full.device
+                )
+            elif name in decoded.sparse:
+                indices, _ = decoded.sparse[name]
+                m = torch.zeros(full.numel(), dtype=torch.bool, device=full.device)
+                if indices.numel() > 0:
+                    m[indices.to(full.device).long()] = True
+                masks[name] = m.view(full.shape)
+        self._delta_masks = masks
         logger.info(
             "Delta: reconstructed step %d (base=%d) sparse=%d dense=%d "
             "unchanged=%d, took %.3fs",
@@ -561,19 +585,39 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
         )
         start_time = time.time()
-        self.colocate_transport.update_weights_in_colocate_mode(
-            self.train_to_infer_device_mapping,
-            self.infer_to_train_device_mapping,
-            self.transfer_rank,
-            self.rank_coordinate,
-            self.infer_world_size,
-            self.send_transfer_plan,
-            self.transfer_plan,
-            self.weights_update_group,
-            self.deserialized_weights,
-            self.parameters,
-            step_id=step_id,
-        )
+        if self._delta_masks is not None:
+            # Delta step: self-copy full locally + cross-rank sparse P2P.
+            value_dtype = next(iter(self.deserialized_weights.values())).dtype
+            self.colocate_transport.apply_delta_colocate(
+                self.train_to_infer_device_mapping,
+                self.infer_to_train_device_mapping,
+                self.transfer_rank,
+                self.rank_coordinate,
+                self.infer_world_size,
+                self.send_transfer_plan,
+                self.transfer_plan,
+                self.weights_update_group,
+                self.deserialized_weights,
+                self._delta_masks,
+                self.parameters,
+                value_dtype,
+                step_id=step_id,
+            )
+            self._delta_masks = None
+        else:
+            self.colocate_transport.update_weights_in_colocate_mode(
+                self.train_to_infer_device_mapping,
+                self.infer_to_train_device_mapping,
+                self.transfer_rank,
+                self.rank_coordinate,
+                self.infer_world_size,
+                self.send_transfer_plan,
+                self.transfer_plan,
+                self.weights_update_group,
+                self.deserialized_weights,
+                self.parameters,
+                step_id=step_id,
+            )
         print_current_gpu_status(
             f"after weights update using NCCL for rank {self.rank_coordinate}"
         )
