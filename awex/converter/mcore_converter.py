@@ -887,11 +887,25 @@ class LinearMLAMcoreConverterMixin:
         if other_key not in layer_cache:
             return []
 
-        fused_tensor = pack_fused_qkv_a_proj_for_tp(
-            layer_cache["q_a_proj"],
-            layer_cache["kv_a_proj"],
-            self.infer_atten_tp_size,
-        )
+        # P97 fix: pack_fused_qkv_a_proj_for_tp lays the fused MLA a_proj out in
+        # infer-TP interleaved order [q_0;kv_0;q_1;kv_1;...], which is ONLY
+        # correct when AWEX subsequently TP-chunks this param back into per-rank
+        # [q_i;kv_i] shards (train attn_tp>1 path). When megatron attn has NO TP
+        # (attn_tp_size==1) the param is resolved as NO_SHARDING: each sglang TP
+        # rank receives the FULL tensor uncut, so it must match sglang's own
+        # load_weights layout `torch.cat([q_a, kv_a], dim=0)` exactly. The
+        # interleave otherwise scrambles the rows (HF-groundtruth rel=1.086,
+        # logp_diff blows up at step2). Emit the plain [q_a;kv_a] concat here.
+        if self.rank_info.attn_tp_size == 1:
+            fused_tensor = torch.cat(
+                [layer_cache["q_a_proj"], layer_cache["kv_a_proj"]], dim=0
+            )
+        else:
+            fused_tensor = pack_fused_qkv_a_proj_for_tp(
+                layer_cache["q_a_proj"],
+                layer_cache["kv_a_proj"],
+                self.infer_atten_tp_size,
+            )
         del self.qkv_a_proj_cache[layer_number]
         return [("attention.fused_qkv_a_proj_with_mqa.weight", fused_tensor)]
 
