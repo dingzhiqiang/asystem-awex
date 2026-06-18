@@ -397,7 +397,11 @@ class NcclColocateStreamBatchTransport:
         nnz_send_p2p = {}  # peer -> [(op, P2POp)]
         nnz_recv_p2p = {}
         recv_nnz_buf = {}  # peer -> [(op, int32[1] tensor)]
-        device = device_util.current_device()
+        # get_torch_device() returns a torch.device; current_device() returns a
+        # bare int which torch interprets as a CUDA ordinal and silently maps to
+        # CPU/raises on the NPU(hccl) backend -> nnz/idx/val built on the wrong
+        # device and the cross-rank isend fails. Match the rest of the codebase.
+        device = device_util.get_torch_device()
 
         for peer_rank, ops in send_ops.items():
             mapped_peer = train_to_infer_device_mapping.get(peer_rank, peer_rank)
@@ -480,8 +484,13 @@ class NcclColocateStreamBatchTransport:
                 recv_rank = train_to_infer_device_mapping.get(
                     op.recv_rank, op.recv_rank
                 )
-                idx = payload.indices.to(device).contiguous()
-                val = payload.values.to(device).contiguous()
+                # copy=True guarantees an independent buffer for the async isend
+                # (parity with the dense path's tensor_sliced.clone()): .to(device)
+                # alone is a no-op when already on-device, so without copy the
+                # send would alias the payload buffer and risk a write-after-read
+                # race if it is reused before the isend drains.
+                idx = payload.indices.to(device=device, copy=True).contiguous()
+                val = payload.values.to(device=device, copy=True).contiguous()
                 p2p.append(
                     (
                         op,
