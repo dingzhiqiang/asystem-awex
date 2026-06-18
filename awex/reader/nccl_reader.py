@@ -587,7 +587,20 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         start_time = time.time()
         if self._delta_masks is not None:
             # Delta step: self-copy full locally + cross-rank sparse P2P.
-            value_dtype = next(iter(self.deserialized_weights.values())).dtype
+            # Cross-rank recv buffers are pre-allocated from a single value
+            # dtype (the protocol carries only nnz, not per-op dtype), so a
+            # mixed-dtype payload would make the recv byte count mismatch the
+            # sent tensor -> silent corruption / hang. Enforce uniformity: the
+            # model structure is identical across ranks, so this assert fires on
+            # all ranks or none (no per-rank divergence). bf16-lossless delta is
+            # the supported scope; extend the protocol to lift this.
+            value_dtypes = {t.dtype for t in self.deserialized_weights.values()}
+            assert len(value_dtypes) == 1, (
+                f"Delta cross-rank transfer requires a uniform payload dtype, got "
+                f"{value_dtypes}; mixed-dtype models are unsupported. Disable "
+                f"AWEX_DELTA_TRANSFER or extend the P2P protocol to carry per-op dtype."
+            )
+            value_dtype = next(iter(value_dtypes))
             self.colocate_transport.apply_delta_colocate(
                 self.train_to_infer_device_mapping,
                 self.infer_to_train_device_mapping,
