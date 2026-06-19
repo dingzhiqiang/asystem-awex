@@ -43,6 +43,37 @@ def _op_key(op):
     return op_key(op)
 
 
+class _PlanView:
+    """Lightweight transfer-plan view exposing a filtered ``operations`` dict.
+
+    transfer_delta_in_colocate_mode only reads ``plan.operations`` (peer -> ops),
+    so a filtered sub-view is enough to scope a two-round P2P transfer to a
+    single dtype group without copying the whole TransferPlan.
+    """
+
+    def __init__(self, operations):
+        self.operations = operations
+
+
+def _filter_plan_by_dtype(plan, dtype, *, is_send):
+    """Filter a transfer plan's operations down to ops of one parameter dtype.
+
+    For mixed-precision delta: each uniform-dtype group runs its own two-round
+    P2P (round 1 carries only nnz, so the recv side needs a single val dtype).
+    Send-side ops are matched on ``send_shard_meta.dtype``, recv-side on
+    ``recv_shard_meta.dtype``; the same parameter has identical dtype on both
+    ends, so a sender's "dtype X" group pairs with the receiver's "dtype X"
+    group. Empty peers are dropped (zero-op peers are no-ops in the schedule).
+    """
+    meta_attr = "send_shard_meta" if is_send else "recv_shard_meta"
+    filtered = {}
+    for peer_rank, ops in plan.operations.items():
+        kept = [op for op in ops if getattr(op, meta_attr).dtype == dtype]
+        if kept:
+            filtered[peer_rank] = kept
+    return _PlanView(filtered)
+
+
 class NcclColocateStreamBatchTransport:
     MAX_STREAMS = 64
 
@@ -961,32 +992,64 @@ class NcclColocateStreamBatchTransport:
                 f"delta self-copy for {rank_coordinate}-{step_id}",
             )
 
-        # --- Cross-rank segment (sparse delta over P2P) ---
-        # Build per-op remapped payloads only for cross-rank send ops.
+        # --- Cross-rank segment (sparse delta over P2P), grouped by dtype ---
+        # The two-round protocol's round 1 carries only nnz (not per-op dtype),
+        # so the recv side pre-allocates val buffers from ONE dtype. To support
+        # mixed-precision models (bf16 body + fp32 MoE router) we partition the
+        # cross-rank ops by their parameter dtype and run one full two-round
+        # transfer per uniform-dtype group. Each group is internally uniform, so
+        # the existing transfer_delta_in_colocate_mode is reused unchanged.
+        #
+        # Deadlock symmetry: the dtype group set must be identical and same-order
+        # on every rank. The model structure is identical across ranks, so we
+        # derive the group set from recv_parameters (the full live inference
+        # view) and iterate sorted(by str). Every rank enters every group's
+        # collective unconditionally (empty group -> zero-nnz, still symmetric),
+        # mirroring the dense path's unconditional transfer call.
         cross_ops = []
         for peer_rank, ops in send_ops.items():
             mapped_peer = train_to_infer_device_mapping.get(peer_rank, peer_rank)
             if mapped_peer == transfer_rank:
                 continue
             cross_ops.extend(ops)
-        send_payloads_by_op = build_send_payloads_by_op(
-            cross_ops, masks, send_full_params
+
+        # Cross-rank op -> param dtype (use the actual send tensor dtype; equals
+        # send_shard_meta.dtype but is the ground truth the payload is built from).
+        def _op_dtype(op):
+            return send_full_params[op.send_shard_meta.name].dtype
+
+        ops_by_dtype = {}
+        for op in cross_ops:
+            ops_by_dtype.setdefault(_op_dtype(op), []).append(op)
+
+        # All-rank-consistent group set + order (model structure identical).
+        all_dtypes = sorted(
+            {t.dtype for t in recv_parameters.values()}, key=str
         )
 
-        # Always enter the cross-rank rounds (even with zero local cross ops):
-        # the recursive-partition schedule is collective, a peer may send to us.
-        # Mirrors the dense path, which unconditionally calls the transfer.
-        return self.transfer_delta_in_colocate_mode(
-            train_to_infer_device_mapping,
-            infer_to_train_device_mapping,
-            transfer_rank,
-            rank_coordinate,
-            world_size,
-            send_transfer_plan,
-            recv_transfer_plan,
-            weights_update_group,
-            send_payloads_by_op,
-            recv_parameters,
-            value_dtype,
-            step_id=step_id,
-        )
+        applied = 0
+        for dt in all_dtypes:
+            group_ops = ops_by_dtype.get(dt, [])
+            send_payloads_by_op = build_send_payloads_by_op(
+                group_ops, masks, send_full_params
+            )
+            sub_send_plan = _filter_plan_by_dtype(send_transfer_plan, dt, is_send=True)
+            sub_recv_plan = _filter_plan_by_dtype(recv_transfer_plan, dt, is_send=False)
+            # Unconditional entry per group keeps the recursive-partition
+            # schedule symmetric across ranks even when this rank has no op in
+            # this dtype group (a peer may still send to us).
+            applied += self.transfer_delta_in_colocate_mode(
+                train_to_infer_device_mapping,
+                infer_to_train_device_mapping,
+                transfer_rank,
+                rank_coordinate,
+                world_size,
+                sub_send_plan,
+                sub_recv_plan,
+                weights_update_group,
+                send_payloads_by_op,
+                recv_parameters,
+                dt,
+                step_id=step_id,
+            )
+        return applied

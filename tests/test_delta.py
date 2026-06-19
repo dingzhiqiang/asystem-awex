@@ -583,6 +583,65 @@ class TestDeltaP2PProtocol:
         assert _mod_p2p.op_key(op0) != _mod_p2p.op_key(op1)
 
 
+class TestFilterPlanByDtype:
+    """Mixed-precision (C plan): cross-rank delta ops are partitioned by dtype
+    so each uniform-dtype group runs its own two-round P2P. Validates the pure
+    plan-filter helper used to scope a transfer to one dtype group."""
+
+    @staticmethod
+    def _op(name, dtype):
+        return SimpleNamespace(
+            send_shard_meta=SimpleNamespace(name=name, dtype=dtype),
+            recv_shard_meta=SimpleNamespace(name=name, dtype=dtype, shape=(4,)),
+            train_slices=(slice(None),),
+            inf_slices=(slice(None),),
+        )
+
+    def _import(self):
+        from awex.transfer.nccl_stream_batch import _filter_plan_by_dtype
+
+        return _filter_plan_by_dtype
+
+    def test_split_bf16_fp32_groups(self):
+        f = self._import()
+        bf, fp = torch.bfloat16, torch.float32
+        plan = SimpleNamespace(operations={
+            0: [self._op("a", bf), self._op("router", fp)],
+            1: [self._op("b", bf)],
+            2: [self._op("router2", fp)],
+        })
+        # bf16 group: a (peer0) + b (peer1); peer2 dropped (no bf16 op)
+        bf_view = f(plan, bf, is_send=True)
+        assert set(bf_view.operations) == {0, 1}
+        assert [o.send_shard_meta.name for o in bf_view.operations[0]] == ["a"]
+        assert [o.send_shard_meta.name for o in bf_view.operations[1]] == ["b"]
+        # fp32 group: router (peer0) + router2 (peer2); peer1 dropped
+        fp_view = f(plan, fp, is_send=True)
+        assert set(fp_view.operations) == {0, 2}
+        assert [o.send_shard_meta.name for o in fp_view.operations[0]] == ["router"]
+        # union over both groups == all ops (no loss, no dup)
+        total = sum(len(v) for v in plan.operations.values())
+        split = sum(len(v) for v in bf_view.operations.values()) + sum(
+            len(v) for v in fp_view.operations.values()
+        )
+        assert split == total
+
+    def test_recv_side_uses_recv_meta_dtype(self):
+        # send/recv filter on their own meta; same param has same dtype both
+        # ends, so a sender's dtype-X group pairs with the receiver's dtype-X.
+        f = self._import()
+        plan = SimpleNamespace(operations={0: [self._op("router", torch.float32)]})
+        assert set(f(plan, torch.float32, is_send=False).operations) == {0}
+        assert set(f(plan, torch.bfloat16, is_send=False).operations) == set()
+
+    def test_empty_group_drops_all_peers(self):
+        # a dtype with no matching op yields an empty plan view (zero-op peers
+        # are no-ops; every rank still enters the group's collective).
+        f = self._import()
+        plan = SimpleNamespace(operations={0: [self._op("a", torch.bfloat16)]})
+        assert f(plan, torch.float32, is_send=True).operations == {}
+
+
 # ---------------------------------------------------------------------------
 # Codec: bitwise comparison
 # ---------------------------------------------------------------------------

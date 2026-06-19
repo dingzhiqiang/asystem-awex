@@ -587,20 +587,12 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         start_time = time.time()
         if self._delta_masks is not None:
             # Delta step: self-copy full locally + cross-rank sparse P2P.
-            # Cross-rank recv buffers are pre-allocated from a single value
-            # dtype (the protocol carries only nnz, not per-op dtype), so a
-            # mixed-dtype payload would make the recv byte count mismatch the
-            # sent tensor -> silent corruption / hang. Enforce uniformity: the
-            # model structure is identical across ranks, so this assert fires on
-            # all ranks or none (no per-rank divergence). bf16-lossless delta is
-            # the supported scope; extend the protocol to lift this.
-            value_dtypes = {t.dtype for t in self.deserialized_weights.values()}
-            assert len(value_dtypes) == 1, (
-                f"Delta cross-rank transfer requires a uniform payload dtype, got "
-                f"{value_dtypes}; mixed-dtype models are unsupported. Disable "
-                f"AWEX_DELTA_TRANSFER or extend the P2P protocol to carry per-op dtype."
-            )
-            value_dtype = next(iter(value_dtypes))
+            # Mixed-dtype models (bf16 body + fp32 MoE router) are supported by
+            # grouping cross-rank ops by dtype inside apply_delta_colocate: each
+            # uniform-dtype group runs its own two-round P2P (round 1 carries
+            # only nnz, so the recv side must pre-allocate val buffers from a
+            # single dtype per group). value_dtype=None tells apply_delta to
+            # derive the per-group dtype itself.
             self.colocate_transport.apply_delta_colocate(
                 self.train_to_infer_device_mapping,
                 self.infer_to_train_device_mapping,
@@ -613,7 +605,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
                 self.deserialized_weights,
                 self._delta_masks,
                 self.parameters,
-                value_dtype,
+                None,
                 step_id=step_id,
             )
             self._delta_masks = None
