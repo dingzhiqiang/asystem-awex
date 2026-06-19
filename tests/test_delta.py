@@ -47,6 +47,7 @@ decode_delta_payload = _mod_codec.decode_delta_payload
 apply_sparse_patch_ = _mod_codec.apply_sparse_patch_
 bitwise_changed_mask = _mod_codec.bitwise_changed_mask
 int_view = _mod_codec.int_view
+invert_adamw = _mod_codec.invert_adamw
 is_delta_payload = _mod_codec.is_delta_payload
 reconstruct_against_base = _mod_codec.reconstruct_against_base
 DELTA_HEADER_NAME = _mod_codec.DELTA_HEADER_NAME
@@ -1068,3 +1069,167 @@ class TestReconstructAgainstBase:
         result, _ = reconstruct_against_base(base, decoded, "cpu")
         result["w"][0] = 99.0
         assert base["w"][0] == 0.0  # base untouched
+
+class TestInvertAdamW:
+    """AdamW inversion: recover pre-step weights from resident moments.
+
+    The single most valuable test — round-trips against a REAL torch.optim.AdamW
+    step, so it validates the formula AND the bias correction (bc1/bc2) against
+    the canonical implementation.
+    """
+
+    def _run_one_step(self, weight_decay, n=64, lr=3e-6, b1=0.9, b2=0.999, eps=1e-8):
+        torch.manual_seed(0)
+        theta_old = torch.randn(n, dtype=torch.float32)
+        p = torch.nn.Parameter(theta_old.clone())
+        opt = torch.optim.AdamW(
+            [p], lr=lr, betas=(b1, b2), eps=eps, weight_decay=weight_decay
+        )
+        p.grad = torch.randn(n, dtype=torch.float32)
+        opt.step()
+        st = opt.state[p]
+        step = float(st["step"])
+        recon = invert_adamw(
+            p.detach(), st["exp_avg"], st["exp_avg_sq"], step,
+            lr, weight_decay, b1, b2, eps,
+        )
+        return theta_old, recon
+
+    def test_roundtrip_with_weight_decay(self):
+        theta_old, recon = self._run_one_step(weight_decay=0.01)
+        assert torch.allclose(recon, theta_old, atol=1e-5, rtol=1e-4)
+
+    def test_roundtrip_no_weight_decay(self):
+        # wd=0 exercises the (1 - lr*wd)=1 branch (the no-wd param group).
+        theta_old, recon = self._run_one_step(weight_decay=0.0)
+        assert torch.allclose(recon, theta_old, atol=1e-5, rtol=1e-4)
+
+    def test_roundtrip_multistep(self):
+        # Invert only the LAST step: recon should equal theta at step N-1.
+        torch.manual_seed(1)
+        n, lr, b1, b2, eps, wd = 32, 1e-3, 0.9, 0.999, 1e-8, 0.02
+        p = torch.nn.Parameter(torch.randn(n))
+        opt = torch.optim.AdamW([p], lr=lr, betas=(b1, b2), eps=eps, weight_decay=wd)
+        for _ in range(4):
+            p.grad = torch.randn(n)
+            opt.step()
+        theta_prev = p.detach().clone()
+        p.grad = torch.randn(n)
+        opt.step()
+        st = opt.state[p]
+        recon = invert_adamw(
+            p.detach(), st["exp_avg"], st["exp_avg_sq"], float(st["step"]),
+            lr, wd, b1, b2, eps,
+        )
+        assert torch.allclose(recon, theta_prev, atol=1e-4, rtol=1e-4)
+
+    def test_result_is_fp32_from_bf16_inputs(self):
+        # Inputs may be bf16 (model param / offloaded moments); result is fp32.
+        theta_t = torch.randn(16, dtype=torch.bfloat16)
+        m = torch.randn(16, dtype=torch.bfloat16)
+        v = torch.rand(16, dtype=torch.bfloat16).abs() + 0.1
+        out = invert_adamw(theta_t, m, v, 5.0, 1e-3, 0.01, 0.9, 0.999, 1e-8)
+        assert out.dtype == torch.float32
+
+
+class TestEncodeExternalMask:
+    """encode(masks=...): change mask supplied externally (inversion detector)."""
+
+    def _seed_inversion(self, names_tensors):
+        tr = DeltaTracker()
+        tr.seed(names_tensors, version=0, store_snapshot=False)
+        return tr
+
+    def test_external_mask_picks_exact_indices(self):
+        # n large enough that 3 changed elements stay under the sparse ratio
+        # (bf16 break-even ~0.3 changed; 3/64 is well under).
+        w = torch.arange(64, dtype=torch.bfloat16)
+        tr = self._seed_inversion([("w", w)])
+        mask = torch.zeros(64, dtype=torch.bool)
+        mask[[1, 4, 7]] = True
+        enc = tr.encode([("w", w)], version=1, masks={"w": mask})
+        # one sparse param: idx + val tensors present, indices == mask.nonzero
+        idx = enc.tensors[enc.names.index("w" + DELTA_IDX_SUFFIX)]
+        val = enc.tensors[enc.names.index("w" + DELTA_VAL_SUFFIX)]
+        assert sorted(idx.tolist()) == [1, 4, 7]
+        assert torch.equal(val.float(), w.view(-1)[[1, 4, 7]].float())
+
+    def test_external_all_false_is_unchanged(self):
+        w = torch.arange(8, dtype=torch.bfloat16)
+        tr = self._seed_inversion([("w", w)])
+        enc = tr.encode(
+            [("w", w)], version=1, masks={"w": torch.zeros(8, dtype=torch.bool)}
+        )
+        assert enc.num_unchanged == 1
+        assert "w" + DELTA_IDX_SUFFIX not in enc.names
+
+    def test_missing_mask_falls_back_dense(self):
+        w = torch.arange(8, dtype=torch.bfloat16)
+        tr = self._seed_inversion([("w", w)])
+        enc = tr.encode([("w", w)], version=1, masks={})  # no entry for "w"
+        assert enc.num_dense_fallback == 1
+        assert "w" in enc.names
+
+    def test_external_mask_no_snapshot_refresh(self):
+        # Inversion mode keeps NO baseline: snapshot_size_bytes stays 0 across
+        # encode (it must not adopt tensors).
+        w = torch.arange(64, dtype=torch.bfloat16)
+        tr = self._seed_inversion([("w", w)])
+        mask = torch.zeros(64, dtype=torch.bool)
+        mask[2] = True
+        tr.encode([("w", w)], version=1, masks={"w": mask})
+        assert tr.snapshot_size_bytes == 0
+
+    def test_external_matches_snapshot_for_same_change(self):
+        # Given the same actual change, the external-mask path and the snapshot
+        # path emit identical sparse indices/values.
+        old = torch.arange(64, dtype=torch.bfloat16)
+        new = old.clone()
+        new[[3, 5]] = torch.tensor([99.0, 42.0], dtype=torch.bfloat16)
+        # snapshot path
+        snap_tr = DeltaTracker()
+        snap_tr.seed([("w", old)], version=0)
+        snap_enc = snap_tr.encode([("w", new)], version=1)
+        # inversion path: feed the true mask
+        inv_tr = DeltaTracker()
+        inv_tr.seed([("w", old)], version=0, store_snapshot=False)
+        mask = bitwise_changed_mask(new, old).view(-1)
+        inv_enc = inv_tr.encode([("w", new)], version=1, masks={"w": mask})
+        s_idx = snap_enc.tensors[snap_enc.names.index("w" + DELTA_IDX_SUFFIX)]
+        i_idx = inv_enc.tensors[inv_enc.names.index("w" + DELTA_IDX_SUFFIX)]
+        assert sorted(s_idx.tolist()) == sorted(i_idx.tolist())
+
+
+class TestSeedStoreSnapshot:
+    def test_store_false_keeps_no_baseline(self):
+        tr = DeltaTracker()
+        tr.seed([("w", torch.arange(8, dtype=torch.bfloat16))], version=3,
+                store_snapshot=False)
+        assert tr.seeded
+        assert tr.base_version == 3
+        assert tr.snapshot_size_bytes == 0
+
+    def test_store_true_unchanged_behaviour(self):
+        # Default path still builds the snapshot (regression guard).
+        tr = DeltaTracker()
+        tr.seed([("w", torch.arange(8, dtype=torch.bfloat16))], version=3)
+        assert tr.snapshot_size_bytes > 0
+
+
+class TestCorrectionAllReduceMath:
+    """The DP correction-allreduce trick: each rank contributes (old-new) on its
+    disjoint owned slice (zero elsewhere); SUM reconstructs the full pre-step
+    param. Simulated single-process for 2 ranks (no comm)."""
+
+    def test_disjoint_slices_sum_reconstructs(self):
+        n = 10
+        theta_t = torch.randn(n, dtype=torch.float32)
+        theta_old = torch.randn(n, dtype=torch.float32)
+        # rank 0 owns [0:6), rank 1 owns [6:10)
+        c0 = torch.zeros(n)
+        c0[0:6] = theta_old[0:6] - theta_t[0:6]
+        c1 = torch.zeros(n)
+        c1[6:10] = theta_old[6:10] - theta_t[6:10]
+        correction = c0 + c1  # all_reduce(SUM)
+        recon = theta_t + correction
+        assert torch.allclose(recon, theta_old, atol=1e-6)

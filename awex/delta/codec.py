@@ -82,6 +82,42 @@ def bitwise_changed_mask(current: torch.Tensor, baseline: torch.Tensor) -> torch
     return int_view(current) != int_view(baseline)
 
 
+@torch.no_grad()
+def invert_adamw(
+    theta_t: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    step: float,
+    lr: float,
+    weight_decay: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+) -> torch.Tensor:
+    """Reconstruct pre-step weights theta_{t-1} from one decoupled-AdamW step.
+
+    Inverse of the torch ``AdamW`` update (decoupled weight decay), used by the
+    AReaL AdamW-inversion change detector to recover the previous weights from
+    the optimizer's resident moments without storing a snapshot:
+
+        theta_t      = theta_{t-1}·(1 - lr·wd) - (lr/bc1)·m / (sqrt(v)/sqrt(bc2) + eps)
+        theta_{t-1}  = (theta_t + (lr/bc1)·m / (sqrt(v)/sqrt(bc2) + eps)) / (1 - lr·wd)
+
+    with ``m=exp_avg``, ``v=exp_avg_sq``, ``bc1 = 1 - beta1^step``,
+    ``bc2 = 1 - beta2^step``. Computed in fp32; the result is fp32 regardless of
+    the input dtype. ``step`` is the 1-based optimizer step count for these
+    moments.
+    """
+    theta = theta_t.to(torch.float32)
+    m = exp_avg.to(torch.float32)
+    v = exp_avg_sq.to(torch.float32)
+    bc1 = 1.0 - beta1**step
+    bc2 = 1.0 - beta2**step
+    denom = (v / bc2).sqrt().add_(eps)
+    update = (lr / bc1) * m / denom
+    return (theta + update) / (1.0 - lr * weight_decay)
+
+
 @dataclass
 class DeltaHeader:
     """Version-chain header carried inside the payload as an int64 tensor."""
@@ -205,6 +241,9 @@ class DeltaTracker:
         self._anchor_interval = anchor_interval
         self._sparse_bytes_ratio = sparse_bytes_ratio
         self._snapshot: dict[str, torch.Tensor] = {}
+        # Inversion mode (seed(store_snapshot=False)) keeps no CPU baseline; it
+        # only records seen names so encode can tell known params from unknown.
+        self._snapshot_names: set[str] = set()
         self._base_version: int | None = None
         self._deltas_since_anchor = 0
         self._force_full = False
@@ -248,43 +287,68 @@ class DeltaTracker:
         return None
 
     def seed(
-        self, named_parameters: Iterable[tuple[str, torch.Tensor]], version: int
+        self,
+        named_parameters: Iterable[tuple[str, torch.Tensor]],
+        version: int,
+        *,
+        store_snapshot: bool = True,
     ) -> None:
-        """(Re)build the CPU baseline snapshot after a full dense transfer."""
+        """(Re)build the baseline after a full dense transfer.
+
+        Args:
+            store_snapshot: when True (default, snapshot detector) build the CPU
+                bf16 baseline used by ``encode(masks=None)``. When False
+                (inversion detector) keep no baseline tensors — change masks come
+                from AdamW inversion, so we only record the seen names so
+                ``encode(masks=...)`` can distinguish known from unknown params.
+        """
         start = time.time()
         self._snapshot.clear()
-        # Dedup tied parameters: aliased names share one CPU tensor object.
-        by_storage: dict[tuple[int, int], torch.Tensor] = {}
-        pin = torch.cuda.is_available()
+        self._snapshot_names.clear()
         count = 0
-        for name, param in named_parameters:
-            data = param.detach()
-            key = (data.data_ptr(), data.numel())
-            cpu_tensor = by_storage.get(key)
-            if cpu_tensor is None:
-                cpu_tensor = data.contiguous().cpu().clone()
-                if pin:
-                    cpu_tensor = cpu_tensor.pin_memory()
-                by_storage[key] = cpu_tensor
-            self._snapshot[name] = cpu_tensor
-            count += 1
+        unique = 0
+        if store_snapshot:
+            # Dedup tied parameters: aliased names share one CPU tensor object.
+            by_storage: dict[tuple[int, int], torch.Tensor] = {}
+            pin = torch.cuda.is_available()
+            for name, param in named_parameters:
+                data = param.detach()
+                key = (data.data_ptr(), data.numel())
+                cpu_tensor = by_storage.get(key)
+                if cpu_tensor is None:
+                    cpu_tensor = data.contiguous().cpu().clone()
+                    if pin:
+                        cpu_tensor = cpu_tensor.pin_memory()
+                    by_storage[key] = cpu_tensor
+                self._snapshot[name] = cpu_tensor
+                count += 1
+            unique = len(by_storage)
+        else:
+            for name, _ in named_parameters:
+                self._snapshot_names.add(name)
+                count += 1
         self._base_version = version
         self._deltas_since_anchor = 0
         self._force_full = False
         self._force_full_reason = ""
         logger.info(
-            "DeltaTracker: seeded snapshot at version %d with %d params "
-            "(%d unique storages, %.1fMB, took %.3fs)",
+            "DeltaTracker: seeded at version %d with %d params "
+            "(snapshot=%s, %d unique storages, %.1fMB, took %.3fs)",
             version,
             count,
-            len(by_storage),
+            store_snapshot,
+            unique,
             self.snapshot_size_bytes / 1e6,
             time.time() - start,
         )
 
     @torch.no_grad()
     def encode(
-        self, named_parameters: Iterable[tuple[str, torch.Tensor]], version: int
+        self,
+        named_parameters: Iterable[tuple[str, torch.Tensor]],
+        version: int,
+        *,
+        masks: dict[str, torch.Tensor] | None = None,
     ) -> EncodedDelta:
         """Diff current weights against the snapshot and build a delta payload.
 
@@ -292,13 +356,20 @@ class DeltaTracker:
             named_parameters: ``(hf_name, tensor)`` pairs in the same naming as
                 ``seed``. Names absent from the snapshot fall back to dense.
             version: The payload (target) version; becomes the new base.
+            masks: optional ``{hf_name: bool change mask}`` from an external
+                detector (AdamW inversion). When provided, the change mask comes
+                from ``masks`` instead of an internal snapshot diff, and the CPU
+                snapshot is NOT refreshed (inversion mode keeps no baseline). A
+                name missing from ``masks`` falls back to dense. When ``masks``
+                is None the behaviour is byte-identical to the snapshot path.
 
-        The snapshot is refreshed in place, so after this call the tracker's
-        base is ``version``.
+        The snapshot is refreshed in place (snapshot mode only), so after this
+        call the tracker's base is ``version``.
         """
         if not self.seeded:
             raise RuntimeError("DeltaTracker not seeded; run a full sync first.")
 
+        external = masks is not None
         start = time.time()
         result = EncodedDelta()
         # Per-call dedup for tied params: same storage -> compute once, emit
@@ -320,17 +391,33 @@ class DeltaTracker:
             result.total_elements += numel
             result.dense_bytes += dense_bytes
 
-            snap = self._snapshot.get(name)
-            if snap is None or snap.dtype != cur.dtype or snap.numel() != numel:
-                # Unknown/reshaped param: send dense, adopt into snapshot.
-                logger.warning(
-                    "DeltaTracker: param %s missing from snapshot or mismatched, "
-                    "sending dense",
-                    name,
-                )
-                self._adopt_snapshot(name, cur)
-                self._emit_dense(result, name, cur, numel, dense_bytes)
-                continue
+            # Resolve the change mask source: external detector vs snapshot.
+            if external:
+                known = name in self._snapshot_names
+                ext_mask = masks.get(name)
+                bad = ext_mask is None or ext_mask.numel() != numel
+                if not known or bad:
+                    # Unknown/missing mask: send dense, adopt name as known.
+                    logger.warning(
+                        "DeltaTracker: param %s has no usable external mask, "
+                        "sending dense",
+                        name,
+                    )
+                    self._snapshot_names.add(name)
+                    self._emit_dense(result, name, cur, numel, dense_bytes)
+                    continue
+            else:
+                snap = self._snapshot.get(name)
+                if snap is None or snap.dtype != cur.dtype or snap.numel() != numel:
+                    # Unknown/reshaped param: send dense, adopt into snapshot.
+                    logger.warning(
+                        "DeltaTracker: param %s missing from snapshot or "
+                        "mismatched, sending dense",
+                        name,
+                    )
+                    self._adopt_snapshot(name, cur)
+                    self._emit_dense(result, name, cur, numel, dense_bytes)
+                    continue
 
             key = (param.detach().data_ptr(), numel)
             if key in computed:
@@ -349,9 +436,12 @@ class DeltaTracker:
                 )
                 continue
 
-            old = snap.to(cur.device, non_blocking=False)
-            mask = bitwise_changed_mask(cur, old)
-            indices = mask.view(-1).nonzero(as_tuple=False).squeeze(1)
+            if external:
+                mask = ext_mask.to(cur.device).reshape(-1)
+            else:
+                old = snap.to(cur.device, non_blocking=False)
+                mask = bitwise_changed_mask(cur, old).view(-1)
+            indices = mask.nonzero(as_tuple=False).squeeze(1)
             changed = indices.numel()
             result.changed_elements += changed
 
@@ -369,12 +459,14 @@ class DeltaTracker:
                 indices = indices.to(torch.int32)
                 self._emit_sparse(result, name, indices, values, elem_size)
                 computed[key] = (name, (indices, values))
-                # Refresh snapshot in place: scatter only the changed elements.
-                snap.view(-1)[indices.cpu().long()] = values.cpu()
+                if not external:
+                    # Refresh snapshot in place: scatter only changed elements.
+                    snap.view(-1)[indices.cpu().long()] = values.cpu()
             else:
                 self._emit_dense(result, name, cur, numel, dense_bytes)
                 computed[key] = (name, None)
-                snap.copy_(cur, non_blocking=False)
+                if not external:
+                    snap.copy_(cur, non_blocking=False)
 
         result.header = DeltaHeader(
             payload_version=version,

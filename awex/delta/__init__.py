@@ -14,6 +14,7 @@ from awex.delta.codec import (
     bitwise_changed_mask,
     decode_delta_payload,
     int_view,
+    invert_adamw,
     is_delta_payload,
     reconstruct_against_base,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "decode_delta_payload",
     "dict_to_patches",
     "int_view",
+    "invert_adamw",
     "is_delta_payload",
     "patches_to_dict",
     "reconstruct_against_base",
