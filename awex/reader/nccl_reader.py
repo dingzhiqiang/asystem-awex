@@ -130,12 +130,13 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         self.deserialized_weights = {}
         # Delta transfer base (env-gated, see _maybe_reconstruct_delta): CPU
         # copy of the last fully-synced train-shard payload + its version.
-        # Sparse payloads are reconstructed against this base before the
-        # (unchanged) NCCL reshard transport runs.
-        self._delta_base: dict = {}
-        self._delta_base_version = None
+        # Delta reconstruct is injected (dte); awex holds no delta base/version.
+        # ``fn(named_tensors, step_id) -> (full, masks_or_None)``; None means no
+        # delta wired (pure dense path). See set_delta_reconstructor.
+        self._delta_reconstructor = None
         # Per-param change mask for the current delta step ({name: bool tensor}),
-        # or None on a dense/anchor step. Drives the cross-rank sparse P2P in
+        # or None on a dense/anchor step. Set by the injected reconstructor's
+        # return; drives the cross-rank sparse P2P in
         # _update_weights_in_colocate_mode; reset every collect.
         self._delta_masks = None
         logger.info(
@@ -340,108 +341,44 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         logger.info(f"Open fds after deserialization: {count_open_fds()}")
 
     def _maybe_reconstruct_delta(self, named_tensors, step_id, device_id):
-        """Reconstruct the full train-shard from a delta + derive change masks.
+        """Hand the raw payload to the injected delta reconstructor (dte).
 
-        Env-gated by ``AWEX_DELTA_TRANSFER``. On a delta payload this rebuilds
-        the full local train-shard from the CPU ``_delta_base`` (needed for the
-        local self-copy segment and as the base for the next version) AND
-        derives the per-param change mask, stored on ``self._delta_masks``, which
-        drives the *cross-rank* sparse P2P in ``_update_weights_in_colocate_mode``
-        (only the changed elements cross the wire — the v1 mistake was sending
-        the reconstructed full tensor cross-rank).
+        The delta algorithm (decode / version-chain base / reconstruct / change-
+        mask build) lives in the standalone dte library now and is injected via
+        ``set_delta_reconstructor`` (the AReaL colocate driver wires it to
+        ``dte.engine.DeltaEngine.reconstruct``). awex keeps only IPC-get, the
+        cross-rank apply, and the writer-coordination handshake — it holds no
+        delta state and does not import any delta algorithm.
 
-        Payloads are self-describing (a ``__awex_delta_header__`` tensor marks a
-        delta); dense full-sync payloads (re)seed the base and clear the masks.
-        Returns the full (dense-shaped) named tensor dict either way.
+        ``fn(named_tensors, step_id) -> (full, masks_or_None)``: ``masks`` is a
+        per-param bool change-mask dict for the cross-rank sparse P2P (stashed on
+        ``self._delta_masks``), or ``None`` for a dense/full-sync step (the dense
+        apply path downstream). Without an injected reconstructor (pure dense,
+        AWEX_DELTA_TRANSFER=0) the payload passes through and masks stay None.
         """
         self._delta_masks = None  # default: dense/anchor step
-        delta_enabled = os.environ.get("AWEX_DELTA_TRANSFER", "0") == "1"
-        from awex.delta import (
-            decode_delta_payload,
-            is_delta_payload,
-            reconstruct_against_base,
-        )
-
-        if not is_delta_payload(named_tensors):
-            if delta_enabled:
-                # Dense full sync: snapshot as the new base for later deltas.
-                self._delta_base = {
-                    name: t.detach().to("cpu", copy=True)
-                    for name, t in named_tensors.items()
-                }
-                self._delta_base_version = step_id
-                logger.info(
-                    "Delta: seeded base from dense full sync at step %d (%d params)",
-                    step_id,
-                    len(self._delta_base),
-                )
-            return named_tensors
-
-        # From here on the payload IS a delta.
-        if not delta_enabled:
-            raise RuntimeError(
-                "Received a delta weight payload but AWEX_DELTA_TRANSFER is not "
-                "enabled on the inference side; writer/reader env mismatch."
-            )
-        decoded = decode_delta_payload(named_tensors)
-        header = decoded.header
-        if self._delta_base_version is None or not self._delta_base:
-            self._request_full_sync(step_id, "reader_base_missing")
-            raise RuntimeError(
-                f"Delta payload at step {step_id} but reader has no base "
-                f"(base_version={self._delta_base_version}); requested full sync."
-            )
-        if header.base_version != self._delta_base_version:
-            self._request_full_sync(step_id, "version_chain_broken")
-            raise RuntimeError(
-                f"Delta version chain broken at step {step_id}: payload base="
-                f"{header.base_version}, reader base={self._delta_base_version}; "
-                f"requested full sync."
-            )
-
-        start = time.time()
+        if self._delta_reconstructor is None:
+            return named_tensors  # no delta wired -> dense passthrough
         try:
-            result, counts = reconstruct_against_base(
-                self._delta_base, decoded, device_id
-            )
-        except ValueError as exc:
-            # e.g. a sparse patch for a name absent from the base: the full
-            # shape is unknown and must not be dead-reckoned. Treat as a
-            # broken chain and request a full sync.
-            self._request_full_sync(step_id, "reconstruct_failed")
+            full, masks = self._delta_reconstructor(named_tensors, step_id)
+        except (RuntimeError, ValueError) as exc:
+            # The reconstructor raises on a broken/missing base or a corrupt
+            # payload. Ask the paired writer to fall back to a dense full sync
+            # (same recovery as the old inline path), then abort this step.
+            self._request_full_sync(step_id, "delta_reconstruct_failed")
             raise RuntimeError(
-                f"Delta reconstruction failed at step {step_id}: {exc}; "
+                f"Delta reconstruct failed at step {step_id}: {exc}; "
                 f"requested full sync."
             ) from exc
-        self._delta_base_version = header.payload_version
-        device_util.synchronize(device_id=device_util.current_device())
-        # Build per-param change masks (for cross-rank sparse P2P). dense-
-        # fallback params changed in full; sparse params changed at scattered
-        # positions; unchanged params get no mask entry (False everywhere).
-        masks = {}
-        for name, full in result.items():
-            if name in decoded.dense:
-                masks[name] = torch.ones(
-                    full.shape, dtype=torch.bool, device=full.device
-                )
-            elif name in decoded.sparse:
-                indices, _ = decoded.sparse[name]
-                m = torch.zeros(full.numel(), dtype=torch.bool, device=full.device)
-                if indices.numel() > 0:
-                    m[indices.to(full.device).long()] = True
-                masks[name] = m.view(full.shape)
-        self._delta_masks = masks
-        logger.info(
-            "Delta: reconstructed step %d (base=%d) sparse=%d dense=%d "
-            "unchanged=%d, took %.3fs",
-            step_id,
-            header.base_version,
-            counts["sparse"],
-            counts["dense"],
-            counts["unchanged"],
-            time.time() - start,
-        )
-        return result
+        self._delta_masks = masks  # None -> dense apply; dict -> delta apply
+        return full
+
+    def set_delta_reconstructor(self, fn):
+        """Inject the delta reconstructor (dte); keeps awex free of dte imports.
+
+        ``fn(named_tensors, step_id) -> (full_params, masks_or_None)``.
+        """
+        self._delta_reconstructor = fn
 
     def _full_sync_marker_key(self):
         """Per-(ip, device) marker key so each colocate pair is independent
