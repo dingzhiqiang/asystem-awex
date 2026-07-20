@@ -252,8 +252,15 @@ class NcclColocateStreamBatchTransport:
         num_rounds = int(math.log2(world_size))
         prefix = f"[{os.getpid()}] [{rank_coordinate}] [step {step_id}]"
         start_time = time.time()
+        total_send_ops = sum(len(ops) for ops in all_send_p2p_ops.values())
+        total_recv_ops = sum(len(ops) for ops in all_recv_p2p_ops.values())
         logger.info(
             f"{prefix} Starting recursive partition transfer with {num_rounds} rounds"
+        )
+        logger.info(
+            f"[dte-perf][awex-recursive] rank={rank_coordinate} step={step_id} "
+            f"send_ops={total_send_ops} recv_ops={total_recv_ops} "
+            f"send_peers={len(all_send_p2p_ops)} recv_peers={len(all_recv_p2p_ops)}"
         )
         for round_idx in range(num_rounds):
             partition_size = world_size // (2**round_idx)
@@ -319,6 +326,11 @@ class NcclColocateStreamBatchTransport:
         device_util.synchronize()
         duration = time.time() - start_time
         logger.info(f"{prefix} All {num_rounds} rounds completed in {duration:.4f}s")
+        logger.info(
+            f"[dte-perf][awex-recursive] rank={rank_coordinate} step={step_id} "
+            f"rounds={num_rounds} total_ms={duration * 1000:.1f} "
+            f"send_ops={total_send_ops} recv_ops={total_recv_ops}"
+        )
 
     def _execute_ops_concurrent(self, ops_dict, peer_ranks):
         """Execute one recursive-partition phase, walking peers in ascending order.
@@ -509,12 +521,13 @@ class NcclColocateStreamBatchTransport:
             elem_size = 2
             try:
                 from awex.util.tensor_util import dtype_to_size as _dtype_size
+
                 elem_size = _dtype_size(sample_op.send_shard_meta.dtype)
             except Exception:
                 pass
             sliced_numel = 1
             try:
-                for s in (sample_op.train_slices or []):
+                for s in sample_op.train_slices or []:
                     span = s.stop - s.start if s.stop is not None else 0
                     sliced_numel *= max(span, 1)
             except Exception:
@@ -544,9 +557,7 @@ class NcclColocateStreamBatchTransport:
                         device=device_util.current_device(),
                         dtype=torch.int64,
                     )
-                    dist.all_reduce(
-                        t, op=dist.ReduceOp.MIN, group=weights_update_group
-                    )
+                    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=weights_update_group)
                     new_step = int(t.item())
                     if new_step != step_size:
                         logger.info(
@@ -579,9 +590,7 @@ class NcclColocateStreamBatchTransport:
                     device=device_util.current_device(),
                     dtype=torch.int64,
                 )
-                dist.all_reduce(
-                    t, op=dist.ReduceOp.MAX, group=weights_update_group
-                )
+                dist.all_reduce(t, op=dist.ReduceOp.MAX, group=weights_update_group)
                 new_n = int(t.item())
                 if new_n != n_chunks:
                     logger.info(
@@ -602,6 +611,7 @@ class NcclColocateStreamBatchTransport:
         total_clone_bytes = 0
 
         for chunk_idx in range(n_chunks):
+            chunk_start_time = time.time()
             start = chunk_idx * step_size
             end = start + step_size
 
@@ -679,15 +689,24 @@ class NcclColocateStreamBatchTransport:
                 step_id,
             )
             device_util.synchronize()
+            chunk_duration = time.time() - chunk_start_time
             logger.warning(
                 f"[CHUNKED-DIAG {task_id}] chunk_idx={chunk_idx}/{n_chunks} EXIT "
                 f"send_peers={len(chunk_send_p2p_ops)} recv_peers={len(chunk_recv_p2p_ops)} "
-                f"clone_mb={chunk_clone_bytes/1024/1024:.1f}"
+                f"clone_mb={chunk_clone_bytes / 1024 / 1024:.1f} "
+                f"took={chunk_duration:.4f}s"
+            )
+            logger.info(
+                f"[dte-perf][awex-chunk] task={task_id} chunk={chunk_idx}/{n_chunks} "
+                f"send_peers={len(chunk_send_p2p_ops)} recv_peers={len(chunk_recv_p2p_ops)} "
+                f"clone_mb={chunk_clone_bytes / 1024 / 1024:.1f} "
+                f"total_ms={chunk_duration * 1000:.1f}"
             )
 
             chunk_send_p2p_ops = None
             chunk_recv_p2p_ops = None
             import gc as _gc
+
             _gc.collect()
             if hasattr(torch, "cuda") and torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -698,4 +717,3 @@ class NcclColocateStreamBatchTransport:
             f"CHUNKED transfer done {task_id}: chunks={n_chunks} step_size={step_size} "
             f"total_clone_mb={total_clone_bytes / 1024 / 1024:.2f}"
         )
-
