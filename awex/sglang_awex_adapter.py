@@ -30,6 +30,7 @@ from awex.meta.weight_meta import (
     ParameterReplicaMeta,
     ParameterShardMeta,
 )
+from awex.models import get_infer_weights_converter
 from awex.sharding.param_sharding import ShardingType
 from awex.sharding.rank_info import RankInfo
 from awex.sharding.sglang_sharding import (
@@ -67,9 +68,30 @@ class AwexSGLangAdapter:
         self._pair_name: str | None = None
         self._timeout_s: float = 120.0
         self._http_client = None
+        self._weight_converter = None
 
     def _get_model(self) -> torch.nn.Module:
         return self._scheduler.tp_worker.model_runner.model
+
+    def _get_model_arch_name(self) -> str:
+        model = self._get_model()
+        config = getattr(model, "config", None)
+        architectures = getattr(config, "architectures", None)
+        if architectures:
+            return architectures[0]
+        return type(model).__name__
+
+    def _get_weight_converter(self):
+        if self._weight_converter is None:
+            rank_info = self._rank_info or self._build_rank_info()
+            self._weight_converter = get_infer_weights_converter(
+                "sglang",
+                self._get_model_arch_name(),
+                self._get_model().config,
+                rank_info,
+                self._scheduler.server_args,
+            )
+        return self._weight_converter
 
     def _get_model_context(self) -> dict[str, Any]:
         server_args = self._scheduler.server_args
@@ -117,6 +139,8 @@ class AwexSGLangAdapter:
         self, name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
         """Split SGLang fused parameters (qkv_proj, gate_up_proj, MoE experts)."""
+        if self._get_model_arch_name() == "BailingMoeV3ForCausalLM":
+            return self._get_weight_converter().convert_param(name, tensor)
         if "qkv_proj" in name:
             cfg = self._get_model().config
             num_heads = cfg.num_attention_heads
