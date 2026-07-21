@@ -128,17 +128,6 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         if self.enable_colocate_mode:
             self._init_reader_in_colocate_mode()
         self.deserialized_weights = {}
-        # Delta transfer base (env-gated, see _maybe_reconstruct_delta): CPU
-        # copy of the last fully-synced train-shard payload + its version.
-        # Delta reconstruct is injected (dte); awex holds no delta base/version.
-        # ``fn(named_tensors, step_id) -> (full, masks_or_None)``; None means no
-        # delta wired (pure dense path). See set_delta_reconstructor.
-        self._delta_reconstructor = None
-        # Per-param change mask for the current delta step ({name: bool tensor}),
-        # or None on a dense/anchor step. Set by the injected reconstructor's
-        # return; drives the cross-rank sparse P2P in
-        # _update_weights_in_colocate_mode; reset every collect.
-        self._delta_masks = None
         logger.info(
             f"Created NCCL weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
@@ -328,10 +317,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         device_util.synchronize(device_id=device_util.current_device())
         tensors = reconstruct_tensors_from_groups(group_shared, metadata)
         device_util.synchronize(device_id=device_util.current_device())
-        named_tensors = dict(zip(names, tensors))
-        self.deserialized_weights = self._maybe_reconstruct_delta(
-            named_tensors, step_id, device_id
-        )
+        self.deserialized_weights = dict(zip(names, tensors))
         logger.info(
             f"Deserialized {len(self.deserialized_weights)} parameters and {len(group_shared)} groups"
         )
@@ -339,67 +325,6 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"GPU status after deserialization for rank {self.rank_coordinate}:\n{get_gpu_status()}"
         )
         logger.info(f"Open fds after deserialization: {count_open_fds()}")
-
-    def _maybe_reconstruct_delta(self, named_tensors, step_id, device_id):
-        """Hand the raw payload to the injected delta reconstructor (dte).
-
-        The delta algorithm (decode / version-chain base / reconstruct / change-
-        mask build) lives in the standalone dte library now and is injected via
-        ``set_delta_reconstructor`` (the AReaL colocate driver wires it to
-        ``dte.engine.DeltaEngine.reconstruct``). awex keeps only IPC-get, the
-        cross-rank apply, and the writer-coordination handshake — it holds no
-        delta state and does not import any delta algorithm.
-
-        ``fn(named_tensors, step_id) -> (full, masks_or_None)``: ``masks`` is a
-        per-param bool change-mask dict for the cross-rank sparse P2P (stashed on
-        ``self._delta_masks``), or ``None`` for a dense/full-sync step (the dense
-        apply path downstream). Without an injected reconstructor (pure dense,
-        AWEX_DELTA_TRANSFER=0) the payload passes through and masks stay None.
-        """
-        self._delta_masks = None  # default: dense/anchor step
-        if self._delta_reconstructor is None:
-            return named_tensors  # no delta wired -> dense passthrough
-        try:
-            full, masks = self._delta_reconstructor(named_tensors, step_id)
-        except (RuntimeError, ValueError) as exc:
-            # The reconstructor raises on a broken/missing base or a corrupt
-            # payload. Ask the paired writer to fall back to a dense full sync
-            # (same recovery as the old inline path), then abort this step.
-            self._request_full_sync(step_id, "delta_reconstruct_failed")
-            raise RuntimeError(
-                f"Delta reconstruct failed at step {step_id}: {exc}; "
-                f"requested full sync."
-            ) from exc
-        self._delta_masks = masks  # None -> dense apply; dict -> delta apply
-        return full
-
-    def set_delta_reconstructor(self, fn):
-        """Inject the delta reconstructor (dte); keeps awex free of dte imports.
-
-        ``fn(named_tensors, step_id) -> (full_params, masks_or_None)``.
-        """
-        self._delta_reconstructor = fn
-
-    def _full_sync_marker_key(self):
-        """Per-(ip, device) marker key so each colocate pair is independent
-        and the paired writer can delete it without racing other writers."""
-        return (
-            f"awex_delta_require_full_sync_{get_ip_address()}_"
-            f"{device_util.current_device()}"
-        )
-
-    def _request_full_sync(self, step_id, reason):
-        """Signal the paired writer to fall back to a dense full sync."""
-        try:
-            self.meta_server_client.put_object(
-                self._full_sync_marker_key(),
-                (self.rank_coordinate, step_id, reason),
-            )
-            logger.error(
-                "Delta: requested full sync at step %d (reason=%s)", step_id, reason
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Delta: failed to request full sync: %s", exc)
 
     @staticmethod
     def _sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs):
@@ -522,44 +447,19 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
         )
         start_time = time.time()
-        if self._delta_masks is not None:
-            # Delta step: self-copy full locally + cross-rank sparse P2P.
-            # Mixed-dtype models (bf16 body + fp32 MoE router) are supported by
-            # grouping cross-rank ops by dtype inside apply_delta_colocate: each
-            # uniform-dtype group runs its own two-round P2P (round 1 carries
-            # only nnz, so the recv side must pre-allocate val buffers from a
-            # single dtype per group). value_dtype=None tells apply_delta to
-            # derive the per-group dtype itself.
-            self.colocate_transport.apply_delta_colocate(
-                self.train_to_infer_device_mapping,
-                self.infer_to_train_device_mapping,
-                self.transfer_rank,
-                self.rank_coordinate,
-                self.infer_world_size,
-                self.send_transfer_plan,
-                self.transfer_plan,
-                self.weights_update_group,
-                self.deserialized_weights,
-                self._delta_masks,
-                self.parameters,
-                None,
-                step_id=step_id,
-            )
-            self._delta_masks = None
-        else:
-            self.colocate_transport.update_weights_in_colocate_mode(
-                self.train_to_infer_device_mapping,
-                self.infer_to_train_device_mapping,
-                self.transfer_rank,
-                self.rank_coordinate,
-                self.infer_world_size,
-                self.send_transfer_plan,
-                self.transfer_plan,
-                self.weights_update_group,
-                self.deserialized_weights,
-                self.parameters,
-                step_id=step_id,
-            )
+        self.colocate_transport.update_weights_in_colocate_mode(
+            self.train_to_infer_device_mapping,
+            self.infer_to_train_device_mapping,
+            self.transfer_rank,
+            self.rank_coordinate,
+            self.infer_world_size,
+            self.send_transfer_plan,
+            self.transfer_plan,
+            self.weights_update_group,
+            self.deserialized_weights,
+            self.parameters,
+            step_id=step_id,
+        )
         print_current_gpu_status(
             f"after weights update using NCCL for rank {self.rank_coordinate}"
         )
