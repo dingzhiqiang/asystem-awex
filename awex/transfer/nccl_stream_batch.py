@@ -254,7 +254,7 @@ class NcclColocateStreamBatchTransport:
             f"{prefix} Starting recursive partition transfer with {num_rounds} rounds"
         )
         logger.info(
-            f"[dte-perf][awex-recursive] rank={rank_coordinate} step={step_id} "
+            f"[perf][awex-recursive] rank={rank_coordinate} step={step_id} "
             f"send_ops={total_send_ops} recv_ops={total_recv_ops} "
             f"send_peers={len(all_send_p2p_ops)} recv_peers={len(all_recv_p2p_ops)}"
         )
@@ -323,7 +323,7 @@ class NcclColocateStreamBatchTransport:
         duration = time.time() - start_time
         logger.info(f"{prefix} All {num_rounds} rounds completed in {duration:.4f}s")
         logger.info(
-            f"[dte-perf][awex-recursive] rank={rank_coordinate} step={step_id} "
+            f"[perf][awex-recursive] rank={rank_coordinate} step={step_id} "
             f"rounds={num_rounds} total_ms={duration * 1000:.1f} "
             f"send_ops={total_send_ops} recv_ops={total_recv_ops}"
         )
@@ -699,7 +699,7 @@ class NcclColocateStreamBatchTransport:
                 f"took={chunk_duration:.4f}s"
             )
             logger.info(
-                f"[dte-perf][awex-chunk] task={task_id} chunk={chunk_idx}/{n_chunks} "
+                f"[perf][awex-chunk] task={task_id} chunk={chunk_idx}/{n_chunks} "
                 f"send_peers={len(chunk_send_p2p_ops)} recv_peers={len(chunk_recv_p2p_ops)} "
                 f"clone_mb={chunk_clone_bytes / 1024 / 1024:.1f} "
                 f"total_ms={chunk_duration * 1000:.1f}"
