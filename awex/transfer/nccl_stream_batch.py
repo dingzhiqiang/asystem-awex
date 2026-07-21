@@ -35,7 +35,6 @@ from awex.util import device as device_util
 logger = logging.getLogger(__name__)
 hang_detector = ThreadPoolExecutor(max_workers=1)
 
-
 class NcclColocateStreamBatchTransport:
     MAX_STREAMS = 64
 
@@ -120,7 +119,6 @@ class NcclColocateStreamBatchTransport:
         all_recv_p2p_ops = {}  # peer_rank -> List[(plan_op, p2p_op)]
         tensors_to_copy = []
         train_slice_context = {}
-        non_contiguous_tensor_pairs = []
 
         # Process send operations
         for peer_rank, ops in send_ops.items():
@@ -146,9 +144,16 @@ class NcclColocateStreamBatchTransport:
                     recv_rank = train_to_infer_device_mapping.get(
                         op.recv_rank, op.recv_rank
                     )
+                    cloned = tensor_sliced.clone()
+                    # Wire-size parity with the receiver's dtype (see the
+                    # chunked path / Problem 69: bf16 gate.weight into an fp32
+                    # recv slot wedges the receiver forever).
+                    recv_dtype = getattr(op.recv_shard_meta, "dtype", None)
+                    if recv_dtype is not None and cloned.dtype != recv_dtype:
+                        cloned = cloned.to(recv_dtype)
                     p2p_op = dist.P2POp(
                         dist.isend if async_op else dist.send,
-                        tensor_sliced.clone(),
+                        cloned,
                         recv_rank,
                         group=weights_update_group,
                     )
@@ -165,10 +170,6 @@ class NcclColocateStreamBatchTransport:
             for op in ops:
                 recv_tensor = recv_parameters[op.recv_shard_meta.name]
                 tensor_sliced = slice_tensor(recv_tensor, op, False)
-                if not tensor_sliced.is_contiguous():
-                    original_tensor = tensor_sliced
-                    tensor_sliced = tensor_sliced.contiguous()
-                    non_contiguous_tensor_pairs.append((original_tensor, tensor_sliced))
                 p2p_op = dist.P2POp(
                     dist.irecv if async_op else dist.recv,
                     tensor_sliced,
@@ -209,12 +210,7 @@ class NcclColocateStreamBatchTransport:
             rank_coordinate,
             step_id,
         )
-        if non_contiguous_tensor_pairs:
-            with torch.no_grad():
-                for original_tensor, recv_tensor in non_contiguous_tensor_pairs:
-                    original_tensor.copy_(recv_tensor)
-                non_contiguous_tensor_pairs.clear()
-                del non_contiguous_tensor_pairs
+
         device_util.synchronize()
         future.set_result(True)
         duration = time.time() - start_time
@@ -381,16 +377,22 @@ class NcclColocateStreamBatchTransport:
             works = dist.batch_isend_irecv(p2p_ops)
             for work in works:
                 work.wait()
-            # work.wait() only blocks the CPU until the CUDA event records
-            # 'enqueued', not actual NCCL kernel completion; syncing per peer
-            # keeps in-flight P2P bounded to one peer and surfaces any hang at
-            # the offending peer rather than at a later boundary.
+            if trace:
+                logger.info(
+                    f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
+                    f"work.wait returned (enqueued) -> synchronize (waiting peer)"
+                )
+            # Force GPU completion before the next peer. work.wait() only
+            # blocks the CPU thread until the CUDA event records 'enqueued',
+            # not actual NCCL kernel completion; syncing per peer keeps
+            # in-flight P2P bounded to one peer and surfaces any hang at the
+            # offending peer rather than at a later chunk boundary.
             if hasattr(torch, "cuda") and torch.cuda.is_available():
                 torch.cuda.synchronize()
             if trace:
                 logger.info(
                     f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
-                    f"batch drained ({len(p2p_ops)} ops)"
+                    f"synchronize done (drained peer, {len(p2p_ops)} ops)"
                 )
             total_ops += len(p2p_ops)
         return total_ops
