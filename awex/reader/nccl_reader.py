@@ -47,6 +47,27 @@ from awex.util.tensor_util import (
 logger = logging.getLogger(__name__)
 
 
+def _wait_colocate_write_finished(
+    meta_server_client,
+    write_finished_key: str,
+    weights_update_group,
+    transfer_rank: int,
+) -> None:
+    """Wait for the colocate writer's release signal without racing key cleanup."""
+
+    meta_server_client.get_object(write_finished_key, 1024**3)
+    dist.barrier(
+        group=weights_update_group,
+        device_ids=[device_util.current_device()],
+    )
+    if transfer_rank == 0:
+        meta_server_client.delete_if_exists(write_finished_key)
+    dist.barrier(
+        group=weights_update_group,
+        device_ids=[device_util.current_device()],
+    )
+
+
 class NCCLWorkerWeightsReader(WorkerWeightsReader):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -497,7 +518,12 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         if device_util.get_device_type() == "cuda":
             torch.cuda.empty_cache()
         write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.get_object_then_delete(write_finished_key)
+        _wait_colocate_write_finished(
+            self.meta_server_client,
+            write_finished_key,
+            self.weights_update_group,
+            self.transfer_rank,
+        )
         logger.info(
             f"Finished updating weights in colocate mode for rank {self.transfer_rank}"
         )
