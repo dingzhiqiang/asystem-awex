@@ -20,8 +20,73 @@ from typing import List, Tuple
 import torch
 
 from awex import logging
+from awex.converter.sglang_converter import SGlangToHFWeightConverter
 
 logger = logging.getLogger(__name__)
+
+
+class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
+    """Convert SGLang Qwen3-MoE names to the train-side HF contract."""
+
+    def _fuse_qkv(self, name: str) -> bool:
+        # The Megatron converter emits canonical q/k/v names for Qwen3.
+        return False
+
+    def _split_gqa_qkv(
+        self, parameter: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_heads = int(self.total_num_heads)
+        num_kv_heads = int(self.total_kv_heads or num_heads)
+        total_units = num_heads + 2 * num_kv_heads
+        shape0 = int(parameter.shape[0])
+        if (shape0 * num_heads) % total_units != 0 or (
+            shape0 * num_kv_heads
+        ) % total_units != 0:
+            raise ValueError(
+                f"qkv dim0 {shape0} is not divisible into q/k/v with "
+                f"num_heads={num_heads}, num_kv_heads={num_kv_heads}"
+            )
+        q_size = shape0 * num_heads // total_units
+        kv_size = shape0 * num_kv_heads // total_units
+        return (
+            parameter.narrow(0, 0, q_size),
+            parameter.narrow(0, q_size, kv_size),
+            parameter.narrow(0, q_size + kv_size, kv_size),
+        )
+
+    def _convert_attention_param(
+        self, name: str, parameter: torch.Tensor, layer_number: str
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if "qkv_proj" in name or "query_key_value" in name:
+            q, k, v = self._split_gqa_qkv(parameter)
+            return [
+                (
+                    name.replace("qkv_proj", "q_proj").replace(
+                        "query_key_value", "q_proj"
+                    ),
+                    q,
+                ),
+                (
+                    name.replace("qkv_proj", "k_proj").replace(
+                        "query_key_value", "k_proj"
+                    ),
+                    k,
+                ),
+                (
+                    name.replace("qkv_proj", "v_proj").replace(
+                        "query_key_value", "v_proj"
+                    ),
+                    v,
+                ),
+            ]
+        return super()._convert_attention_param(name, parameter, layer_number)
+
+    def _convert_layer_norm_param(
+        self, name: str, parameter: torch.Tensor, layer_number: str
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if "q_norm" in name or "k_norm" in name:
+            return [(name, parameter)]
+        return super()._convert_layer_norm_param(name, parameter, layer_number)
 
 
 def _build_mcore_converter_qwen3_moe():
@@ -48,9 +113,7 @@ def _build_mcore_converter_qwen3_moe():
             head_dim = getattr(self.hf_config, "head_dim", None)
             if head_dim:
                 return int(head_dim)
-            return int(
-                self.hf_config.hidden_size // self.hf_config.num_attention_heads
-            )
+            return int(self.hf_config.hidden_size // self.hf_config.num_attention_heads)
 
         def _split_gqa_qkv(
             self, parameter: torch.Tensor
@@ -58,6 +121,17 @@ def _build_mcore_converter_qwen3_moe():
             hf = self.hf_config
             head_dim = self._gqa_head_dim()
             attn_tp = max(1, int(getattr(self.rank_info, "attn_tp_size", 1)))
+            if hf.num_key_value_heads % attn_tp != 0:
+                raise ValueError(
+                    f"num_key_value_heads ({hf.num_key_value_heads}) must be "
+                    f"divisible by attn_tp_size ({attn_tp})"
+                )
+            if hf.num_attention_heads % hf.num_key_value_heads != 0:
+                raise ValueError(
+                    f"num_attention_heads ({hf.num_attention_heads}) must be "
+                    f"divisible by num_key_value_heads "
+                    f"({hf.num_key_value_heads})"
+                )
             num_groups = hf.num_key_value_heads // attn_tp
             q_per_group = hf.num_attention_heads // hf.num_key_value_heads
             group_rows = (q_per_group + 2) * head_dim
@@ -71,9 +145,7 @@ def _build_mcore_converter_qwen3_moe():
                 )
             blocks = parameter.reshape(num_groups, group_rows, *parameter.shape[1:])
             q_rows = q_per_group * head_dim
-            q = blocks[:, :q_rows].reshape(
-                num_groups * q_rows, *parameter.shape[1:]
-            )
+            q = blocks[:, :q_rows].reshape(num_groups * q_rows, *parameter.shape[1:])
             k = blocks[:, q_rows : q_rows + head_dim].reshape(
                 num_groups * head_dim, *parameter.shape[1:]
             )
@@ -103,4 +175,5 @@ def _build_mcore_converter_qwen3_moe():
 CONFIG = {
     "model_name": "Qwen3MoeForCausalLM",
     "mcore_converter": _build_mcore_converter_qwen3_moe,
+    "sglang_converter": SGlangToHFWeightConverterQwen3Moe,
 }
