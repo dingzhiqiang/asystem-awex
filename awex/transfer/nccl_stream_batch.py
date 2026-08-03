@@ -35,6 +35,110 @@ from awex.util import device as device_util
 logger = logging.getLogger(__name__)
 hang_detector = ThreadPoolExecutor(max_workers=1)
 
+_EXPERT_PARAM_MARKER = ".mlp.experts."
+
+
+def _is_expert_transfer_op(op) -> bool:
+    """Return whether an op transfers a canonical routed-expert parameter."""
+    send_meta = getattr(op, "send_shard_meta", None)
+    recv_meta = getattr(op, "recv_shard_meta", None)
+    send_name = getattr(send_meta, "name", "")
+    recv_name = getattr(recv_meta, "name", "")
+    return (
+        _EXPERT_PARAM_MARKER in send_name
+        and _EXPERT_PARAM_MARKER in recv_name
+        and send_name == recv_name
+    )
+
+
+def _wire_dtype(op, fallback: torch.dtype) -> torch.dtype:
+    """Resolve the dtype posted by the receiver for a transfer operation."""
+    recv_meta = getattr(op, "recv_shard_meta", None)
+    return getattr(recv_meta, "dtype", None) or fallback
+
+
+def _partition_expert_p2p_entries(
+    entries: list[tuple[object, torch.Tensor]], pack_experts: bool
+) -> tuple[
+    list[tuple[object, torch.Tensor]],
+    list[tuple[torch.dtype, list[tuple[object, torch.Tensor]]]],
+]:
+    """Split entries into direct ops and deterministic expert dtype buckets."""
+    if not pack_experts:
+        return entries, []
+    direct_entries = []
+    expert_buckets = {}
+    for op, tensor in entries:
+        if _is_expert_transfer_op(op):
+            wire_dtype = _wire_dtype(op, tensor.dtype)
+            expert_buckets.setdefault(wire_dtype, []).append((op, tensor))
+        else:
+            direct_entries.append((op, tensor))
+    packed_entries = [
+        (wire_dtype, expert_buckets[wire_dtype])
+        for wire_dtype in sorted(expert_buckets, key=str)
+    ]
+    return direct_entries, packed_entries
+
+
+def _packed_recv_staging_bytes(ops: list[object]) -> int:
+    """Return staging bytes needed to pack the expert operations in ``ops``."""
+    total_bytes = 0
+    for op in ops:
+        if not _is_expert_transfer_op(op):
+            continue
+        send_meta = getattr(op, "send_shard_meta", None)
+        fallback_dtype = getattr(send_meta, "dtype", torch.float32)
+        wire_dtype = _wire_dtype(op, fallback_dtype)
+        numel = math.prod(getattr(op, "overlap_shape", ()) or ())
+        total_bytes += numel * torch.empty((), dtype=wire_dtype).element_size()
+    return total_bytes
+
+
+@torch.no_grad()
+def _pack_p2p_send_tensors(
+    tensors: list[torch.Tensor], wire_dtype: torch.dtype
+) -> torch.Tensor:
+    """Copy tensors into one dense, independent P2P send buffer."""
+    if not tensors:
+        raise ValueError("Cannot pack an empty tensor list")
+    device = tensors[0].device
+    total_numel = sum(tensor.numel() for tensor in tensors)
+    packed = torch.empty(total_numel, dtype=wire_dtype, device=device)
+    offset = 0
+    for tensor in tensors:
+        if tensor.device != device:
+            raise ValueError(
+                f"Packed P2P tensors must share a device: {device} != {tensor.device}"
+            )
+        numel = tensor.numel()
+        packed.narrow(0, offset, numel).view(tensor.shape).copy_(tensor)
+        offset += numel
+    return packed
+
+
+def _prepare_packed_p2p_recv_tensor(
+    tensors: list[torch.Tensor], wire_dtype: torch.dtype
+) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+    """Allocate one packed recv buffer and views to copy into target tensors."""
+    if not tensors:
+        raise ValueError("Cannot prepare an empty packed recv tensor list")
+    device = tensors[0].device
+    total_numel = sum(tensor.numel() for tensor in tensors)
+    packed = torch.empty(total_numel, dtype=wire_dtype, device=device)
+    copyback_pairs = []
+    offset = 0
+    for tensor in tensors:
+        if tensor.device != device:
+            raise ValueError(
+                f"Packed P2P tensors must share a device: {device} != {tensor.device}"
+            )
+        numel = tensor.numel()
+        packed_view = packed.narrow(0, offset, numel).view(tensor.shape)
+        copyback_pairs.append((tensor, packed_view))
+        offset += numel
+    return packed, copyback_pairs
+
 
 def _clone_p2p_send_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Return a dense tensor suitable for torch.distributed P2P send."""
@@ -267,6 +371,8 @@ class NcclColocateStreamBatchTransport:
         weights_update_group,
         rank_coordinate,
         step_id,
+        *,
+        synchronize_at_end=True,
     ):
         """
         Execute P2P transfer using recursive partition algorithm.
@@ -352,7 +458,12 @@ class NcclColocateStreamBatchTransport:
                 f"phase1={num_ops} ops, phase2={num_ops2} ops, "
                 f"took {round_duration:.4f}s"
             )
-        device_util.synchronize()
+        # The chunked caller synchronizes once at its chunk boundary after
+        # this function returns.  Avoid doing the same device-wide sync here
+        # and immediately again in _run_chunked; the legacy path keeps the
+        # original default for safety.
+        if synchronize_at_end:
+            device_util.synchronize()
         duration = time.time() - start_time
         logger.info(f"{prefix} All {num_rounds} rounds completed in {duration:.4f}s")
 
@@ -399,40 +510,69 @@ class NcclColocateStreamBatchTransport:
         # receiver. peer_ranks is already an ascending range here.
         trace = os.environ.get("AWEX_P2P_TRACE", "").strip() in ("1", "true", "True")
         my_rank = self.transfer_rank
+        sync_peer_groups = os.environ.get("AWEX_P2P_GROUP_SYNC", "1").strip() in (
+            "1",
+            "true",
+            "True",
+        )
+        try:
+            peer_group_size = max(
+                1, int(os.environ.get("AWEX_P2P_PEER_GROUP_SIZE", "1") or "1")
+            )
+        except ValueError:
+            peer_group_size = 1
+
+        # Keep the group boundaries identical on every rank.  In particular,
+        # do not group only ``ops_dict``'s non-empty peers: senders and
+        # receivers can have different sparse peer sets.  Fixed peer-rank
+        # ranges preserve the same FIFO ordering while allowing a small,
+        # bounded amount of overlap.  The default remains one peer per batch,
+        # which is the deadlock-safe behavior established in 8bc8fc1.
+        peer_ranks = list(peer_ranks)
         total_ops = 0
-        for peer_rank in peer_ranks:
-            ops = ops_dict.get(peer_rank)
-            if not ops:
-                continue
-            p2p_ops = [p2p_op for _, p2p_op in ops]
-            if not p2p_ops:
+        for group_start in range(0, len(peer_ranks), peer_group_size):
+            peer_group = peer_ranks[group_start : group_start + peer_group_size]
+            grouped_ops = []
+            grouped_peer_counts = []
+            for peer_rank in peer_group:
+                ops = ops_dict.get(peer_rank)
+                if not ops:
+                    grouped_peer_counts.append((peer_rank, 0))
+                    continue
+                p2p_ops = [p2p_op for _, p2p_op in ops]
+                if not p2p_ops:
+                    grouped_peer_counts.append((peer_rank, 0))
+                    continue
+                grouped_peer_counts.append((peer_rank, len(p2p_ops)))
+                grouped_ops.extend(p2p_ops)
+
+            if not grouped_ops:
                 continue
             if trace:
                 logger.info(
-                    f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
-                    f"nops={len(p2p_ops)} -> batch_isend_irecv (pre-wait)"
+                    f"[P2P-TRACE rank={my_rank}] peers={peer_group} "
+                    f"counts={grouped_peer_counts} nops={len(grouped_ops)} "
+                    f"group_size={peer_group_size} -> batch_isend_irecv (pre-wait)"
                 )
-            works = dist.batch_isend_irecv(p2p_ops)
+            works = dist.batch_isend_irecv(grouped_ops)
             for work in works:
                 work.wait()
-            if trace:
-                logger.info(
-                    f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
-                    f"work.wait returned (enqueued) -> synchronize (waiting peer)"
-                )
-            # Force GPU completion before the next peer. work.wait() only
-            # blocks the CPU thread until the CUDA event records 'enqueued',
-            # not actual NCCL kernel completion; syncing per peer keeps
-            # in-flight P2P bounded to one peer and surfaces any hang at the
-            # offending peer rather than at a later chunk boundary.
-            if hasattr(torch, "cuda") and torch.cuda.is_available():
+            # ``work.wait()`` still drains the NCCL work handle.  The extra
+            # device-wide synchronize is retained as the default safety mode,
+            # but can be disabled for performance experiments; the chunk
+            # boundary below always performs a final device synchronize.
+            if (
+                sync_peer_groups
+                and hasattr(torch, "cuda")
+                and torch.cuda.is_available()
+            ):
                 torch.cuda.synchronize()
             if trace:
                 logger.info(
-                    f"[P2P-TRACE rank={my_rank}] peer={peer_rank} "
-                    f"synchronize done (drained peer)"
+                    f"[P2P-TRACE rank={my_rank}] peers={peer_group} "
+                    f"synchronize={'done' if sync_peer_groups else 'skipped'}"
                 )
-            total_ops += len(p2p_ops)
+            total_ops += len(grouped_ops)
         return total_ops
 
     def _run_chunked(
@@ -471,6 +611,12 @@ class NcclColocateStreamBatchTransport:
 
         Local self-copy (tensors_to_copy) and self-recv-from-other-trains do
         not consume clone memory and are emitted once up front.
+
+        ``AWEX_PACK_EXPERT_P2P=1`` preserves the canonical per-expert plan but
+        coalesces each peer/chunk/wire-dtype group into one NCCL message. This
+        isolates P2P launch/work overhead from converter and sharding changes.
+        The receiver stages packed messages and copies their views into the
+        original SGLang parameter slices after the chunk has completed.
         """
         train_slice_context = {}
 
@@ -529,9 +675,36 @@ class NcclColocateStreamBatchTransport:
                 actual_send_rank,
                 group=weights_update_group,
             )
-            local_self_recv_built.append(
-                (actual_send_rank, op, p2p_op, copyback_pair)
+            local_self_recv_built.append((actual_send_rank, op, p2p_op, copyback_pair))
+
+        pack_expert_p2p = os.environ.get("AWEX_PACK_EXPERT_P2P", "0").strip() in (
+            "1",
+            "true",
+            "True",
+        )
+        # The defensive local-self receive path posts operations outside the
+        # normal per-peer chunk index. Packing only one side would change the
+        # P2P FIFO, so disable packing globally if any rank needs that path.
+        pack_safe = pack_expert_p2p and not local_self_recv_built
+        if dist.is_initialized():
+            pack_safe_tensor = torch.tensor(
+                [int(pack_safe)],
+                device=device_util.get_torch_device(),
+                dtype=torch.int32,
             )
+            dist.all_reduce(
+                pack_safe_tensor,
+                op=dist.ReduceOp.MIN,
+                group=weights_update_group,
+            )
+            pack_safe = bool(pack_safe_tensor.item())
+        if pack_expert_p2p and not pack_safe:
+            logger.warning(
+                f"[CHUNKED {task_id}] Expert P2P packing disabled because at "
+                "least one rank requires the local-self receive fallback"
+            )
+        pack_expert_p2p = pack_safe
+        logger.info(f"[CHUNKED {task_id}] expert_p2p_packing={pack_expert_p2p}")
 
         if len(tensors_to_copy) > 0:
             send_rank_for_self = infer_to_train_device_mapping[transfer_rank]
@@ -564,12 +737,13 @@ class NcclColocateStreamBatchTransport:
             elem_size = 2
             try:
                 from awex.util.tensor_util import dtype_to_size as _dtype_size
+
                 elem_size = _dtype_size(sample_op.send_shard_meta.dtype)
             except Exception:
                 pass
             sliced_numel = 1
             try:
-                for s in (sample_op.train_slices or []):
+                for s in sample_op.train_slices or []:
                     span = s.stop - s.start if s.stop is not None else 0
                     sliced_numel *= max(span, 1)
             except Exception:
@@ -596,12 +770,10 @@ class NcclColocateStreamBatchTransport:
                 if dist.is_initialized():
                     t = torch.tensor(
                         [int(step_size)],
-                        device=device_util.current_device(),
+                        device=device_util.get_torch_device(),
                         dtype=torch.int64,
                     )
-                    dist.all_reduce(
-                        t, op=dist.ReduceOp.MIN, group=weights_update_group
-                    )
+                    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=weights_update_group)
                     new_step = int(t.item())
                     if new_step != step_size:
                         logger.info(
@@ -631,12 +803,10 @@ class NcclColocateStreamBatchTransport:
             if dist.is_initialized():
                 t = torch.tensor(
                     [int(n_chunks)],
-                    device=device_util.current_device(),
+                    device=device_util.get_torch_device(),
                     dtype=torch.int64,
                 )
-                dist.all_reduce(
-                    t, op=dist.ReduceOp.MAX, group=weights_update_group
-                )
+                dist.all_reduce(t, op=dist.ReduceOp.MAX, group=weights_update_group)
                 new_n = int(t.item())
                 if new_n != n_chunks:
                     logger.info(
@@ -654,7 +824,87 @@ class NcclColocateStreamBatchTransport:
             f"max_send_per_peer={max_send_len} max_recv_per_peer={max_recv_len}"
         )
 
+        # Packed receive buffers remain alive for every peer until the chunk
+        # finishes and its views have been copied back.  Bound their combined
+        # peak before allocating any of them.  If one rank cannot pack safely,
+        # every rank must use the direct protocol to keep P2P FIFO identical.
+        if pack_expert_p2p:
+            local_max_recv_stage_bytes = max(
+                (
+                    sum(
+                        _packed_recv_staging_bytes(ops[start : start + step_size])
+                        for ops in recv_per_peer.values()
+                    )
+                    for start in range(0, n_chunks * step_size, step_size)
+                ),
+                default=0,
+            )
+            cap_mb_raw = os.environ.get("AWEX_PACK_RECV_STAGING_MB", "").strip()
+            try:
+                recv_stage_cap_bytes = (
+                    max(1, int(float(cap_mb_raw) * 1024 * 1024))
+                    if cap_mb_raw
+                    else chunk_bytes
+                )
+            except ValueError:
+                logger.warning(
+                    f"[CHUNKED {task_id}] Invalid AWEX_PACK_RECV_STAGING_MB="
+                    f"{cap_mb_raw!r}; using chunk_bytes={chunk_bytes}"
+                )
+                recv_stage_cap_bytes = chunk_bytes
+
+            global_max_recv_stage_bytes = local_max_recv_stage_bytes
+            global_recv_stage_cap_bytes = recv_stage_cap_bytes
+            if dist.is_initialized():
+                stage_and_cap = torch.tensor(
+                    [local_max_recv_stage_bytes, recv_stage_cap_bytes],
+                    device=device_util.get_torch_device(),
+                    dtype=torch.int64,
+                )
+                dist.all_reduce(
+                    stage_and_cap[:1],
+                    op=dist.ReduceOp.MAX,
+                    group=weights_update_group,
+                )
+                dist.all_reduce(
+                    stage_and_cap[1:],
+                    op=dist.ReduceOp.MIN,
+                    group=weights_update_group,
+                )
+                global_max_recv_stage_bytes = int(stage_and_cap[0].item())
+                global_recv_stage_cap_bytes = int(stage_and_cap[1].item())
+
+            if global_max_recv_stage_bytes > global_recv_stage_cap_bytes:
+                pack_expert_p2p = False
+                logger.warning(
+                    f"[CHUNKED {task_id}] Expert P2P packing disabled before "
+                    "allocation: global_recv_stage_mb="
+                    f"{global_max_recv_stage_bytes / 1024 / 1024:.1f} exceeds "
+                    "cap_mb="
+                    f"{global_recv_stage_cap_bytes / 1024 / 1024:.1f}"
+                )
+            else:
+                logger.info(
+                    f"[CHUNKED {task_id}] packed recv staging preflight: "
+                    "global_peak_mb="
+                    f"{global_max_recv_stage_bytes / 1024 / 1024:.1f} "
+                    f"cap_mb={global_recv_stage_cap_bytes / 1024 / 1024:.1f}"
+                )
+
         total_clone_bytes = 0
+        total_send_logical_expert_ops = 0
+        total_send_packed_expert_ops = 0
+        total_recv_logical_expert_ops = 0
+        total_recv_packed_expert_ops = 0
+        total_recv_staging_bytes = 0
+        # Preserve the established per-chunk cache trim by default. Packed
+        # staging adds another large temporary allocation, so changing this
+        # safety behavior should remain an explicit experiment.
+        trim_cuda_cache = os.environ.get("AWEX_CHUNK_EMPTY_CACHE", "1").strip() in (
+            "1",
+            "true",
+            "True",
+        )
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * step_size
@@ -668,12 +918,18 @@ class NcclColocateStreamBatchTransport:
             chunk_recv_p2p_ops = {}
             chunk_recv_tensor_pairs = []
             chunk_clone_bytes = 0
+            chunk_send_logical_expert_ops = 0
+            chunk_send_packed_expert_ops = 0
+            chunk_recv_logical_expert_ops = 0
+            chunk_recv_packed_expert_ops = 0
+            chunk_recv_staging_bytes = 0
 
             for mapped_peer_rank, ops in send_per_peer.items():
                 sub = ops[start:end]
                 if not sub:
                     continue
                 p2p_ops = []
+                transfer_entries = []
                 for op in sub:
                     send_tensor = send_parameters[op.send_shard_meta.name]
                     tensor_sliced = slice_tensor(
@@ -682,6 +938,18 @@ class NcclColocateStreamBatchTransport:
                     recv_rank = train_to_infer_device_mapping.get(
                         op.recv_rank, op.recv_rank
                     )
+                    if recv_rank != mapped_peer_rank:
+                        raise ValueError(
+                            "Transfer-plan peer does not match operation target: "
+                            f"mapped_peer={mapped_peer_rank}, target={recv_rank}"
+                        )
+                    transfer_entries.append((op, tensor_sliced))
+
+                direct_entries, packed_expert_entries = _partition_expert_p2p_entries(
+                    transfer_entries, pack_expert_p2p
+                )
+                for op, tensor_sliced in direct_entries:
+                    wire_dtype = _wire_dtype(op, tensor_sliced.dtype)
                     cloned = _clone_p2p_send_tensor(tensor_sliced)
                     # Wire-size parity: the receiver posts irecv with ITS shard
                     # dtype. 961 plan ops (mlp.gate.weight, 124 edges) are bf16
@@ -689,19 +957,33 @@ class NcclColocateStreamBatchTransport:
                     # bf16 bytes into an fp32-sized recv leaves the receiver
                     # waiting forever (deterministic chunk-7 deadlock,
                     # Problem 69). Cast the clone to the receiver's dtype.
-                    recv_dtype = getattr(op.recv_shard_meta, "dtype", None)
-                    if recv_dtype is not None and cloned.dtype != recv_dtype:
-                        cloned = cloned.to(recv_dtype)
+                    if cloned.dtype != wire_dtype:
+                        cloned = cloned.to(wire_dtype)
                     if not cloned.is_contiguous():
                         cloned = cloned.contiguous()
                     p2p_op = dist.P2POp(
                         dist.isend if async_op else dist.send,
                         cloned,
-                        recv_rank,
+                        mapped_peer_rank,
                         group=weights_update_group,
                     )
                     p2p_ops.append((op, p2p_op))
                     chunk_clone_bytes += cloned.numel() * cloned.element_size()
+
+                for wire_dtype, bucket in packed_expert_entries:
+                    packed = _pack_p2p_send_tensors(
+                        [tensor for _, tensor in bucket], wire_dtype
+                    )
+                    p2p_op = dist.P2POp(
+                        dist.isend if async_op else dist.send,
+                        packed,
+                        mapped_peer_rank,
+                        group=weights_update_group,
+                    )
+                    p2p_ops.append((bucket[0][0], p2p_op))
+                    chunk_clone_bytes += packed.numel() * packed.element_size()
+                    chunk_send_logical_expert_ops += len(bucket)
+                    chunk_send_packed_expert_ops += 1
                 chunk_send_p2p_ops[mapped_peer_rank] = p2p_ops
 
             for recv_from_rank, ops in recv_per_peer.items():
@@ -709,9 +991,17 @@ class NcclColocateStreamBatchTransport:
                 if not sub:
                     continue
                 p2p_ops = []
+                transfer_entries = []
                 for op in sub:
                     recv_tensor = recv_parameters[op.recv_shard_meta.name]
                     tensor_sliced = slice_tensor(recv_tensor, op, False)
+                    transfer_entries.append((op, tensor_sliced))
+
+                direct_entries, packed_expert_entries = _partition_expert_p2p_entries(
+                    transfer_entries, pack_expert_p2p
+                )
+                for op, tensor_sliced in direct_entries:
+                    wire_dtype = _wire_dtype(op, tensor_sliced.dtype)
                     tensor_sliced, copyback_pair = _prepare_p2p_recv_tensor(
                         tensor_sliced
                     )
@@ -724,10 +1014,31 @@ class NcclColocateStreamBatchTransport:
                         group=weights_update_group,
                     )
                     p2p_ops.append((op, p2p_op))
+
+                for wire_dtype, bucket in packed_expert_entries:
+                    packed, copyback_pairs = _prepare_packed_p2p_recv_tensor(
+                        [tensor for _, tensor in bucket], wire_dtype
+                    )
+                    p2p_op = dist.P2POp(
+                        dist.irecv if async_op else dist.recv,
+                        packed,
+                        recv_from_rank,
+                        group=weights_update_group,
+                    )
+                    p2p_ops.append((bucket[0][0], p2p_op))
+                    chunk_recv_tensor_pairs.extend(copyback_pairs)
+                    chunk_recv_logical_expert_ops += len(bucket)
+                    chunk_recv_packed_expert_ops += 1
+                    chunk_recv_staging_bytes += packed.numel() * packed.element_size()
                 chunk_recv_p2p_ops[recv_from_rank] = p2p_ops
 
             if chunk_idx == 0 and local_self_recv_built:
-                for actual_send_rank, op, p2p_op, copyback_pair in local_self_recv_built:
+                for (
+                    actual_send_rank,
+                    op,
+                    p2p_op,
+                    copyback_pair,
+                ) in local_self_recv_built:
                     chunk_recv_p2p_ops.setdefault(actual_send_rank, []).append(
                         (op, p2p_op)
                     )
@@ -742,32 +1053,49 @@ class NcclColocateStreamBatchTransport:
                 weights_update_group,
                 rank_coordinate,
                 step_id,
+                synchronize_at_end=False,
             )
             device_util.synchronize()
             if chunk_recv_tensor_pairs:
                 logger.info(
                     f"[CHUNKED {task_id}] syncing {len(chunk_recv_tensor_pairs)} "
-                    f"non-contiguous recv buffers for chunk {chunk_idx}"
+                    f"staged recv buffers for chunk {chunk_idx}"
                 )
                 _sync_p2p_recv_tensor_pairs(chunk_recv_tensor_pairs)
                 device_util.synchronize()
             logger.warning(
                 f"[CHUNKED-DIAG {task_id}] chunk_idx={chunk_idx}/{n_chunks} EXIT "
                 f"send_peers={len(chunk_send_p2p_ops)} recv_peers={len(chunk_recv_p2p_ops)} "
-                f"clone_mb={chunk_clone_bytes/1024/1024:.1f}"
+                f"clone_mb={chunk_clone_bytes / 1024 / 1024:.1f} "
+                f"recv_stage_mb={chunk_recv_staging_bytes / 1024 / 1024:.1f} "
+                f"expert_send_ops={chunk_send_logical_expert_ops}->"
+                f"{chunk_send_packed_expert_ops} "
+                f"expert_recv_ops={chunk_recv_logical_expert_ops}->"
+                f"{chunk_recv_packed_expert_ops}"
             )
 
             chunk_send_p2p_ops = None
             chunk_recv_p2p_ops = None
             chunk_recv_tensor_pairs = None
             import gc as _gc
+
             _gc.collect()
-            if hasattr(torch, "cuda") and torch.cuda.is_available():
+            if trim_cuda_cache and hasattr(torch, "cuda") and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             total_clone_bytes += chunk_clone_bytes
+            total_send_logical_expert_ops += chunk_send_logical_expert_ops
+            total_send_packed_expert_ops += chunk_send_packed_expert_ops
+            total_recv_logical_expert_ops += chunk_recv_logical_expert_ops
+            total_recv_packed_expert_ops += chunk_recv_packed_expert_ops
+            total_recv_staging_bytes += chunk_recv_staging_bytes
 
         logger.info(
             f"CHUNKED transfer done {task_id}: chunks={n_chunks} step_size={step_size} "
-            f"total_clone_mb={total_clone_bytes / 1024 / 1024:.2f}"
+            f"total_clone_mb={total_clone_bytes / 1024 / 1024:.2f} "
+            f"total_recv_stage_mb={total_recv_staging_bytes / 1024 / 1024:.2f} "
+            f"expert_send_ops={total_send_logical_expert_ops}->"
+            f"{total_send_packed_expert_ops} "
+            f"expert_recv_ops={total_recv_logical_expert_ops}->"
+            f"{total_recv_packed_expert_ops}"
         )
