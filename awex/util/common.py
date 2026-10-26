@@ -290,11 +290,29 @@ class AttrDict(dict):
 
 
 def simple_hf_config(hg_config):
-    config = hg_config.to_dict()
-    final_config = {}
-    for k, v in config.items():
-        if "sglang" in str(v):
-            logger.warning(f"Skipping sglang config {k}: {v}")
-            continue
-        final_config[k] = v
-    return AttrDict(**config)
+    """Copy model metadata without SGLang's quantizer runtime back-reference.
+
+    SGLang's get_quant_config inserts the original HF object under
+    quantization_config['hf_config'] (or compression_config). This creates a
+    cycle that HF's to_dict leaves as an object inside the quantization dict.
+    It cannot be rendered as JSON or unpickled in a different engine runtime.
+    Preserve the actual quantization fields and never stringify config values.
+    """
+
+    def portable(value, parent_key=None):
+        if isinstance(value, dict):
+            return {
+                key: portable(item, key)
+                for key, item in value.items()
+                if not (
+                    parent_key in {"quantization_config", "compression_config"}
+                    and key == "hf_config"
+                )
+            }
+        if isinstance(value, list):
+            return [portable(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(portable(item) for item in value)
+        return value
+
+    return AttrDict(portable(hg_config.to_dict()))
